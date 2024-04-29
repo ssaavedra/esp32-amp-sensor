@@ -53,7 +53,7 @@ fn main() -> Result<(), EspError> {
     gpio26.set_high()?;
 
     let mut display_handler = display::init_display_i2c(
-        peripherals.pins.gpio27,
+        peripherals.pins.gpio25,
         peripherals.pins.gpio14,
         peripherals.i2c0,
         DisplaySize128x32,
@@ -84,8 +84,7 @@ fn main() -> Result<(), EspError> {
     let mut driver = AdcDriver::new(peripherals.adc1, &adc_config)?;
 
     let adc_value = Arc::new(Mutex::new(0f32));
-
-    configure_http_server(&adc_value)?;
+    let _server = configure_http_server(&adc_value)?;
 
     loop {
         {
