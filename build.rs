@@ -5,6 +5,9 @@ pub struct Config {
 
     #[default("")]
     wifi_psk: &'static str,
+
+    #[default("")]
+    hostname: &'static str,
 }
 
 fn main() {

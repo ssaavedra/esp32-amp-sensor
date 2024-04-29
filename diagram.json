@@ -1,34 +1,36 @@
 {
     "version": 1,
-    "editor": "wokwi",
     "author": "Santiago Saavedra <info@ssaavedra.eu>",
+    "editor": "wokwi",
     "parts": [
-        {
-            "type": "board-esp32-devkit-c-v4",
-            "id": "esp",
-            "top": 0.59,
-            "left": 0.67,
-            "attrs": {
-                "flashSize": "16"
-            }
-        }
+      {
+        "type": "board-esp32-devkit-c-v4",
+        "id": "esp",
+        "top": 19.2,
+        "left": 33.64,
+        "attrs": { "flashSize": "16" }
+      },
+      { "type": "board-ssd1306", "id": "oled", "top": -83.26, "left": 29.03, "attrs": {} },
+      {
+        "type": "wokwi-potentiometer",
+        "id": "potentiometer",
+        "top": 268.6,
+        "left": 40.5,
+        "rotate": 90,
+        "attrs": {}
+      }
     ],
     "connections": [
-        [
-            "esp:TX",
-            "$serialMonitor:RX",
-            "",
-            []
-        ],
-        [
-            "esp:RX",
-            "$serialMonitor:TX",
-            "",
-            []
-        ]
+      [ "esp:TX", "$serialMonitor:RX", "", [] ],
+      [ "esp:RX", "$serialMonitor:TX", "", [] ],
+      [ "esp:CMD", "oled:GND", "black", [ "h-38.25", "v-336", "h76.8" ] ],
+      [ "esp:3V3", "oled:VCC", "red", [ "h-57.45", "v-182.4", "h105.45" ] ],
+      [ "esp:25", "oled:SDA", "yellow", [ "h-67.05", "v-278.4", "h182.33" ] ],
+      [ "esp:14", "oled:SCL", "orange", [ "h-95.85", "v-297.6", "h201.3" ] ],
+      [ "potentiometer:GND", "esp:CMD", "black", [ "h-48", "v-86.4" ] ],
+      [ "potentiometer:SIG", "esp:35", "green", [ "h-124.8", "v-211.6" ] ],
+      [ "potentiometer:VCC", "esp:3V3", "red", [ "h-172.8", "v-269.6" ] ]
     ],
-    "serialMonitor": {
-        "display": "terminal",
-        "convertEol": true
-    }
-}
+    "serialMonitor": { "display": "terminal", "convertEol": true },
+    "dependencies": {}
+  }
