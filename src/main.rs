@@ -1,11 +1,8 @@
-use esp_idf_svc::hal::adc;
+use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::PinDriver;
-use esp_idf_svc::handle::RawHandle;
+use esp_idf_svc::hal::{adc, gpio};
 use esp_idf_svc::nvs;
-use esp_idf_svc::sys::esp_netif_set_hostname;
-use esp_idf_svc::wifi::{AccessPointConfiguration, WifiEvent};
 use esp_idf_svc::{
-    eventloop::EspSystemEventLoop,
     hal::{
         adc::{attenuation, AdcChannelDriver, AdcDriver},
         delay::FreeRtos,
@@ -13,12 +10,10 @@ use esp_idf_svc::{
         peripherals::Peripherals,
     },
     sys::EspError,
-    wifi::{self, ClientConfiguration},
 };
 use http_server::{configure_http_server, configure_setup_http_server};
 use ssd1306::prelude::Brightness;
 use ssd1306::size::DisplaySize128x32;
-use std::ops::Deref;
 use std::{
     fmt::Write,
     sync::{Arc, Mutex},
@@ -27,6 +22,8 @@ use std::{
 pub mod amps;
 pub mod display;
 pub mod http_server;
+pub mod wifi;
+use crate::wifi::AppWifi as _;
 
 // AC Voltage is 220V
 const AC_VOLTS: f32 = 220.0;
@@ -51,7 +48,9 @@ fn main() -> Result<(), EspError> {
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
     let peripherals = Peripherals::take().unwrap();
-    let sysloop = EspSystemEventLoop::take().unwrap();
+    let sysloop = EspSystemEventLoop::take()?;
+    let nvs = nvs::EspNvsPartition::<nvs::NvsDefault>::take()?;
+    let mut nvs_partition = nvs::EspNvs::new(nvs.clone(), "ssaa", true)?;
 
     // Set Pin 26 as OUTPUT and HIGH so that we have a VCC for the screen in the same side of everything
     // as the 3V3 pin is on the other side of the board
@@ -69,43 +68,8 @@ fn main() -> Result<(), EspError> {
 
     let app_config = CONFIG;
 
-    // Initialize nvs before starting wifi
-    let nvs = nvs::EspNvsPartition::<nvs::NvsDefault>::take()?;
-    let default_partition = nvs::EspNvs::new(nvs.clone(), "ssaa", true)?;
-    let mut setup_mode = false;
-    let wifi_ssid = {
-        let mut buf = [0u8; 32];
-        if let Err(e) = default_partition.get_str("wifi_ssid", &mut buf) {
-            log::info!("Error reading wifi_ssid from NVS: {:?}", e);
-            buf.copy_from_slice(app_config.wifi_ssid.as_bytes());
-        } else {
-            log::info!("Read wifi_ssid from NVS {:}", String::from_utf8_lossy(&buf));
-        }
-        let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let buf = String::from_utf8_lossy(&buf[..nul]);
-        if buf.chars().count() == 0 {
-            setup_mode = true;
-        }
-        buf.to_string()
-    };
-    let wifi_psk = {
-        let mut buf = [0u8; 64];
-        if let Err(e) = default_partition.get_str("wifi_psk", &mut buf) {
-            log::info!("Error reading wifi_psk from NVS: {:?}", e);
-            buf.copy_from_slice(app_config.wifi_psk.as_bytes());
-        } else {
-            log::info!(
-                "Read wifi_psk from NVS {:}",
-                String::from_utf8_lossy(&buf).to_string()
-            );
-        }
-        let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let buf = String::from_utf8_lossy(&buf[..nul]);
-        if buf.chars().count() == 0 {
-            setup_mode = true;
-        }
-        buf.to_string()
-    };
+    let (wifi_ssid, wifi_psk, mut setup_mode) =
+        wifi::get_ssid_psk_from_nvs(&app_config, &nvs_partition, false)?;
     log::info!(
         "SSID: {:?} (len={}), PSK: {:?} (len={}) (setup={})",
         wifi_ssid.as_bytes(),
@@ -114,51 +78,15 @@ fn main() -> Result<(), EspError> {
         wifi_psk.chars().count(),
         setup_mode
     );
-
-    let wifi = Arc::new(Mutex::new(wifi::EspWifi::new(
+    let wifi = wifi::setup_wifi(
         peripherals.modem,
-        sysloop.clone(),
-        Some(nvs),
-    )?));
-    let wifi_config = if setup_mode {
-        wifi::Configuration::AccessPoint(AccessPointConfiguration {
-            ssid: heapless::String::try_from(app_config.wifi_ssid).expect("SSID too long"),
-            password: heapless::String::try_from(app_config.wifi_psk).expect("Password too long"),
-            auth_method: wifi::AuthMethod::WPA2Personal,
-            ..Default::default()
-        })
-    } else {
-        wifi::Configuration::Client(ClientConfiguration {
-            ssid: heapless::String::try_from(wifi_ssid.as_str()).expect("SSID too long"),
-            password: heapless::String::try_from(wifi_psk.as_str()).expect("Password too long"),
-            ..Default::default()
-        })
-    };
-    {
-        let wifi = wifi.lock();
-        let mut wifi = wifi.unwrap();
-        if let Err(err) = wifi.set_configuration(&wifi_config) {
-            log::info!("Wifi not started, error={}, starting now", err);
-        }
-        wifi.start()?;
-        if !setup_mode {
-            wifi.connect()?;
-        }
-    }
-
-    let w2 = wifi.clone();
-
-    sysloop.subscribe::<WifiEvent, _>(move |event| {
-        if let WifiEvent::ApStaConnected = event {
-            log::info!("Connected to Wi-Fi");
-            // Set hostname now!
-            unsafe {
-                // Safe because we are passing a null-terminated string and sta_netif_mut must exist when connected to wifi
-                esp_netif_set_hostname(w2.lock().unwrap().sta_netif().handle(), "wattometer\0".as_ptr() as _);
-            }
-            log::info!("Hostname set to {}", app_config.hostname);
-        }
-    })?;
+        wifi_ssid,
+        wifi_psk,
+        setup_mode,
+        &nvs,
+        &sysloop,
+    )?;
+    wifi::set_wifi_hostname("wattometer".to_string(), Arc::downgrade(&wifi), &sysloop);
 
     let adc_config = adc::config::Config::new();
     let mut chan_driver: AdcChannelDriver<{ attenuation::DB_2_5 }, Gpio35> =
@@ -166,19 +94,78 @@ fn main() -> Result<(), EspError> {
     let mut driver = AdcDriver::new(peripherals.adc1, &adc_config)?;
 
     let adc_value = Arc::new(Mutex::new(0f32));
-    let _server = if setup_mode {
-        configure_setup_http_server()?
+    let mut server = if setup_mode {
+        configure_setup_http_server(&mut nvs_partition)?
     } else {
         configure_http_server(&adc_value)?
     };
 
     let gpio0 = peripherals.pins.gpio0;
-    let gpio0 = PinDriver::input(gpio0).unwrap();
+    let gpio0 = PinDriver::input(gpio0)?;
+
+    let gpio2 = peripherals.pins.gpio2;
+    let mut gpio2 = PinDriver::output(gpio2)?;
+    gpio2.set_drive_strength(gpio::DriveStrength::I5mA)?;
+
+    let mut setup_mode_changed;
+    let mut last_setup_mode = setup_mode;
 
     loop {
+        if last_setup_mode != setup_mode {
+            setup_mode_changed = true;
+            last_setup_mode = setup_mode;
+        } else {
+            setup_mode_changed = false;
+        }
+
+        if setup_mode_changed {
+            drop(server);
+
+            let (wifi_ssid, wifi_psk, _setup_mode) =
+                wifi::get_ssid_psk_from_nvs(&app_config, &nvs_partition, setup_mode)?;
+            log::info!(
+                "SSID: {:?} (len={}), PSK: {:?} (len={}) (setup={})",
+                wifi_ssid.as_bytes(),
+                wifi_ssid.chars().count(),
+                wifi_psk,
+                wifi_psk.chars().count(),
+                setup_mode
+            );
+            wifi::reset_wifi(wifi.clone(), wifi_ssid, wifi_psk, setup_mode)?;
+            // wifi::set_wifi_hostname("wattometer".to_string(), Arc::downgrade(&wifi), &sysloop);
+
+            server = if setup_mode {
+                configure_setup_http_server(&mut nvs_partition)?
+            } else {
+                configure_http_server(&adc_value)?
+            };
+        };
+
         if setup_mode {
+            display_handler.run(|d| d.clear());
             display_handler.run(|d| write!(d, "SETUP MODE AP:\n{}\n", app_config.wifi_ssid));
             display_handler.run(|d| write!(d, "KEY:\n{}\n", app_config.wifi_psk));
+
+            // Blink the LED
+            gpio2.set_high()?;
+            FreeRtos::delay_ms(1000u32);
+            gpio2.set_low()?;
+            FreeRtos::delay_ms(1000u32); // Wait for longer, since this will just refresh the screen
+
+            if gpio0.is_low() {
+                // If the BOOT button is pressed, we will exit setup mode
+                setup_mode = false;
+                // Blink twice to confirm
+                gpio2.set_high()?;
+                FreeRtos::delay_ms(100u32);
+                gpio2.set_low()?;
+                FreeRtos::delay_ms(100u32);
+                gpio2.set_high()?;
+                FreeRtos::delay_ms(100u32);
+                gpio2.set_low()?;
+                FreeRtos::delay_ms(500u32);
+                continue;
+            }
         } else {
             // If the BOOT button is pressed, we will enter setup mode
             if gpio0.is_low() {
@@ -188,24 +175,36 @@ fn main() -> Result<(), EspError> {
                 log::info!("Normal mode");
             }
 
+            // Tiny blink of LED if normal mode and wifi is connected
+            if wifi.is_connected()? {
+                gpio2.set_high()?;
+                FreeRtos::delay_ms(100u32);
+                gpio2.set_low()?;
+            }
+
             display_handler.init(Brightness::DIM);
-            let guard = adc_value.lock();
-            let mut amps = guard.unwrap();
-            *amps = amps::read_amps(&mut driver, &mut chan_driver).unwrap();
+            let amps = amps::read_amps(&mut driver, &mut chan_driver).unwrap();
+            {
+                let guard = adc_value.try_lock();
+                match guard {
+                    Ok(mut guard) => *guard = amps,
+                    Err(_) => log::warn!("ADC value is locked"),
+                }
+            };
 
-            log::info!("Amps: {:.5}A ; {:.5}W", *amps, AC_VOLTS * *amps);
+            log::info!("Amps: {:.5}A ; {:.5}W", amps, AC_VOLTS * amps);
             display_handler.run(|d| d.set_position(0, 0));
-            display_handler.run(|d| write!(d, "{:.5}A    \n{:.5}W    \n", *amps, AC_VOLTS * *amps));
+            display_handler.run(|d| write!(d, "{:.5}A    \n{:.5}W    \n", amps, AC_VOLTS * amps));
 
-            if wifi.lock().unwrap().is_connected()? {
-                let ip = wifi.lock().unwrap().sta_netif().get_ip_info()?.ip;
+            if wifi.is_connected()? {
+                let ip = wifi.get_client_ip()?;
                 display_handler.run(|d| write!(d, "{}\n", ip));
             } else {
                 display_handler.run(|d| write!(d, "CONNECTING..."));
             }
         }
 
-        // Sleep 500ms
+        // Sleep 1500ms
         FreeRtos::delay_ms(1500u32);
     }
 }

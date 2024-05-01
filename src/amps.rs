@@ -1,14 +1,8 @@
 use esp_idf_svc::hal::adc;
+use esp_idf_svc::hal::adc::{AdcChannelDriver, AdcDriver};
 use esp_idf_svc::hal::gpio::ADCPin;
 use esp_idf_svc::sys::{adc_atten_t, EspError};
-use esp_idf_svc::{
-    hal::{
-        adc::{attenuation, AdcChannelDriver, AdcDriver},
-    },
-};
 use std::time::SystemTime;
-
-
 
 // SCT-013-030 has a 1V output for 30A
 // 30A = 1V
@@ -18,9 +12,10 @@ const FACTOR: f32 = 1. / 0.0333;
 pub fn read_amps<const A: adc_atten_t, T, ADC: adc::Adc>(
     driver: &mut AdcDriver<ADC>,
     chan_driver: &mut AdcChannelDriver<A, T>,
-) -> Result<f32, EspError> where
-T: ADCPin<Adc = ADC>,
-    {
+) -> Result<f32, EspError>
+where
+    T: ADCPin<Adc = ADC>,
+{
     // Since we are working with 50Hz AC, we have a cycle every 20ms
     // We will sample for 500ms to get 25 samples
 

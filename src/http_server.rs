@@ -1,12 +1,11 @@
 use esp_idf_svc::{
     http::server::{Configuration, EspHttpServer},
+    io::EspIOError,
     nvs,
     sys::EspError,
 };
-use std::{
-    fmt::Write,
-    sync::{Arc, Mutex},
-};
+use std::fmt::Write;
+use std::sync::{Arc, Mutex};
 
 use crate::AC_VOLTS;
 
@@ -50,39 +49,45 @@ fn split_urlencoded_kv<'a>(input: &'a str) -> (&'a str, String) {
     (key, value[..nul].to_string())
 }
 
+fn render_setup_page<'r>(
+    req: esp_idf_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection<'r>>,
+) -> Result<(), EspIOError> {
+    let mut server_msg = String::new();
+    write!(
+        server_msg,
+        "<!DOCTYPE html>
+    <html><head><title>Coarse watt-o-meter</title></head>
+    <body>
+    <form action=\"/save\" method=\"post\">
+    <label for=\"wifi_ssid\">Wi-Fi SSID:</label><br>
+    <input type=\"text\" id=\"wifi_ssid\" name=\"wifi_ssid\"><br>
+    <label for=\"wifi_psk\">Wi-Fi Password:</label><br>
+    <input type=\"password\" id=\"wifi_psk\" name=\"wifi_psk\"><br><br>
+    <input type=\"submit\" value=\"Submit\">
+    </body></html>"
+    )
+    .unwrap();
+    req.into_response(200, Some("OK"), &[("Content-Type", "text/html")])?
+        .write(server_msg.as_bytes())?;
+    Ok(())
+}
+
 #[inline(always)]
-pub fn configure_setup_http_server<'a>() -> Result<EspHttpServer<'a>, EspError> {
+pub fn configure_setup_http_server<'a>(
+    nvs: &'a mut nvs::EspNvs<nvs::NvsDefault>,
+) -> Result<EspHttpServer<'a>, EspError> {
     let server_config = Configuration::default();
     let mut server = EspHttpServer::new(&server_config).expect("Failed to create server");
-    server.fn_handler(
-        "/",
-        esp_idf_svc::http::Method::Get,
-        |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            let mut server_msg = String::new();
-            write!(
-                server_msg,
-                "<!DOCTYPE html>
-        <html><head><title>Coarse watt-o-meter</title></head>
-        <body>
-        <form action=\"/save\" method=\"post\">
-        <label for=\"wifi_ssid\">Wi-Fi SSID:</label><br>
-        <input type=\"text\" id=\"wifi_ssid\" name=\"wifi_ssid\"><br>
-        <label for=\"wifi_psk\">Wi-Fi Password:</label><br>
-        <input type=\"password\" id=\"wifi_psk\" name=\"wifi_psk\"><br><br>
-        <input type=\"submit\" value=\"Submit\">
-        </body></html>"
-            )
-            .unwrap();
-            req.into_response(200, Some("OK"), &[("Content-Type", "text/html")])?
-                .write(server_msg.as_bytes())?;
-            Ok(())
-        },
-    )?;
+
+    let nvs = Arc::new(Mutex::new(nvs));
+
+    server.fn_handler("/", esp_idf_svc::http::Method::Get, render_setup_page)?;
+    server.fn_handler("/save", esp_idf_svc::http::Method::Get, render_setup_page)?;
 
     server.fn_handler(
         "/save",
         esp_idf_svc::http::Method::Post,
-        |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
             // Check that we have received wifi_ssid and wifi_psk as form data
             let mut buf = [0u8; 128];
             let read_bytes = req.read(&mut buf)?;
@@ -104,7 +109,7 @@ pub fn configure_setup_http_server<'a>() -> Result<EspHttpServer<'a>, EspError> 
             if wifi_ssid.is_empty() || wifi_psk.is_empty() {
                 req.into_response(400, Some("Bad Request"), &[("Content-Type", "text/plain")])?
                     .write("Missing Wi-Fi SSID or Password".as_bytes())?;
-                return Ok(());
+                Ok(())
             } else {
                 log::info!(
                     "Received Wi-Fi SSID: {:?}, Password: {:?}",
@@ -112,23 +117,61 @@ pub fn configure_setup_http_server<'a>() -> Result<EspHttpServer<'a>, EspError> 
                     wifi_psk
                 );
 
+                let mut nvs = nvs.lock().unwrap();
+
                 // Send the response before restarting the device!
-                req.into_response(200, Some("OK"), &[("Content-Type", "text/plain")])?
+                let written_bytes = req
+                    .into_response(200, Some("OK"), &[("Content-Type", "text/plain")])?
                     .write("Saved Wi-Fi credentials and restarting system".as_bytes())?;
 
-                // Save the values to NVS
-                let nvs = nvs::EspNvsPartition::<nvs::NvsDefault>::take()?;
-                let mut default_partition = nvs::EspNvs::new(nvs.clone(), "ssaa", true)?;
-                default_partition.set_str("wifi_ssid", &wifi_ssid)?;
-                default_partition.set_str("wifi_psk", &wifi_psk)?;
+                log::info!("Sent response of {} bytes", written_bytes);
 
-                // Reboot the device
-                unsafe { esp_idf_svc::sys::esp_restart() };
+                if let Err(x) = nvs.set_str("wifi_ssid", &wifi_ssid) {
+                    log::warn!("Error setting wifi_ssid in NVS: {:?}", x);
+                }
+                log::info!("Setting Wi-Fi SSID in NVS");
+                if let Err(x) = nvs.set_str("wifi_psk", &wifi_psk) {
+                    log::warn!("Error setting wifi_psk in NVS: {:?}", x);
+                }
+                log::info!("Setting Wi-Fi PSK in NVS");
+
+                log::info!("Saved Wi-Fi credentials to NVS");
+
+                // Restart the device
+                unsafe {
+                    esp_idf_svc::sys::esp_restart();
+                }
+            }
+        },
+    )?;
+
+    server.fn_handler(
+        "/restart",
+        esp_idf_svc::http::Method::Get,
+        |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            req.into_response(200, Some("OK"), &[("Content-Type", "text/plain")])?
+                .write("Restarting system".as_bytes())?;
+
+            unsafe {
+                esp_idf_svc::sys::esp_restart();
             }
         },
     )?;
 
     Ok(server)
+}
+
+fn with_locked_value<'a, T, F, R>(expose_value: &'a Arc<Mutex<T>>, f: F) -> R
+where
+    F: FnOnce(T) -> R,
+    T: Copy,
+{
+    let mutex_handle = expose_value.lock().unwrap();
+    f(*mutex_handle)
+}
+
+fn identity<T>(x: T) -> T {
+    x
 }
 
 #[inline(always)]
@@ -138,33 +181,37 @@ pub fn configure_http_server<'a>(
     // // Start Http Server
     let server_config = Configuration::default();
     let mut server = EspHttpServer::new(&server_config).expect("Failed to create server");
-    server
-        .fn_handler(
-            "/",
-            esp_idf_svc::http::Method::Get,
-            |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-                log::info!("Got request");
-                let mut server_msg = String::new();
-                let mutex_handle = expose_value.lock().unwrap();
-                let amps: f32 = *mutex_handle;
-                write!(server_msg, "<!DOCTYPE html><html><head><title>Coarse watt-o-meter</title></head><body><a href=\"/amps\">Amps: {:.5}A</a><br /><a href=\"/watts\">{:.5}W</a></body></html>", amps, AC_VOLTS * amps).unwrap();
-                req.into_response(
-                    200,
-                    Some("OK"),
-                    &[("Content-Type", "text/html")],
-                )?.write(server_msg.as_bytes())?;
+    server.fn_handler(
+        "/",
+        esp_idf_svc::http::Method::Get,
+        |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            log::info!("Got request");
+            let mut server_msg = String::new();
+            write!(
+                server_msg,
+                "<!DOCTYPE html>
+                    <html><head><title>Coarse watt-o-meter</title></head>
+                    <body><a href=\"/amps\">Amps: {:.5}A</a><br />
+                    <a href=\"/watts\">{:.5}W</a></body>
+                    </html>",
+                with_locked_value(expose_value, identity),
+                with_locked_value(expose_value, identity) * AC_VOLTS
+            )
+            .expect("Failed to write");
 
-                Ok(())
-            },
-        )?;
+            req.into_response(200, Some("OK"), &[("Content-Type", "text/html")])?
+                .write(server_msg.as_bytes())?;
+
+            Ok(())
+        },
+    )?;
 
     server.fn_handler(
         "/amps",
         esp_idf_svc::http::Method::Get,
         |req| -> Result<(), esp_idf_svc::io::EspIOError> {
             let mut server_msg = String::new();
-            let mutex_handle = expose_value.lock().unwrap();
-            let amps: f32 = *mutex_handle;
+            let amps = with_locked_value(expose_value, identity);
             write!(server_msg, "{:.12}", amps).unwrap();
             req.into_response(200, Some("OK"), &[("Content-Type", "text/plain")])?
                 .write(server_msg.as_bytes())?;
@@ -178,9 +225,9 @@ pub fn configure_http_server<'a>(
         esp_idf_svc::http::Method::Get,
         |req| -> Result<(), esp_idf_svc::io::EspIOError> {
             let mut server_msg = String::new();
-            let mutex_handle = expose_value.lock().unwrap();
-            let amps: f32 = *mutex_handle;
-            write!(server_msg, "{:.12}", AC_VOLTS * amps).unwrap();
+            let amps: f32 = with_locked_value(expose_value, identity);
+            let watts = amps * AC_VOLTS;
+            write!(server_msg, "{:.12}", watts).unwrap();
             req.into_response(200, Some("OK"), &[("Content-Type", "text/plain")])?
                 .write(server_msg.as_bytes())?;
 
