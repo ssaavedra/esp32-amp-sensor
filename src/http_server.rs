@@ -4,6 +4,7 @@ use esp_idf_svc::{
     nvs,
     sys::EspError,
 };
+use once_cell::sync::Lazy;
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 
@@ -49,6 +50,9 @@ fn split_urlencoded_kv<'a>(input: &'a str) -> (&'a str, String) {
     (key, value[..nul].to_string())
 }
 
+static CURRENT_KNOWN_WIFI_SSID: Lazy<Arc<Mutex<String>>> =
+    Lazy::new(|| Arc::new(Mutex::new(String::new())));
+
 fn render_setup_page<'r>(
     req: esp_idf_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection<'r>>,
 ) -> Result<(), EspIOError> {
@@ -56,15 +60,16 @@ fn render_setup_page<'r>(
     write!(
         server_msg,
         "<!DOCTYPE html>
-    <html><head><title>Coarse watt-o-meter</title></head>
-    <body>
-    <form action=\"/save\" method=\"post\">
-    <label for=\"wifi_ssid\">Wi-Fi SSID:</label><br>
-    <input type=\"text\" id=\"wifi_ssid\" name=\"wifi_ssid\"><br>
-    <label for=\"wifi_psk\">Wi-Fi Password:</label><br>
-    <input type=\"password\" id=\"wifi_psk\" name=\"wifi_psk\"><br><br>
-    <input type=\"submit\" value=\"Submit\">
-    </body></html>"
+        <html><head><title>Coarse watt-o-meter</title></head>
+        <body>
+        <form action=\"/save\" method=\"post\">
+        <label for=\"wifi_ssid\">Wi-Fi SSID:</label><br>
+        <input type=\"text\" id=\"wifi_ssid\" name=\"wifi_ssid\" value=\"{}\"><br>
+        <label for=\"wifi_psk\">Wi-Fi Password:</label><br>
+        <input type=\"password\" id=\"wifi_psk\" name=\"wifi_psk\"><br><br>
+        <input type=\"submit\" value=\"Submit\">
+        </body></html>",
+        with_locked_value(&CURRENT_KNOWN_WIFI_SSID.clone(), identity)
     )
     .unwrap();
     req.into_response(200, Some("OK"), &[("Content-Type", "text/html")])?
@@ -161,13 +166,28 @@ pub fn configure_setup_http_server<'a>(
     Ok(server)
 }
 
-fn with_locked_value<'a, T, F, R>(expose_value: &'a Arc<Mutex<T>>, f: F) -> R
-where
-    F: FnOnce(T) -> R,
-    T: Copy,
-{
-    let mutex_handle = expose_value.lock().unwrap();
-    f(*mutex_handle)
+trait LockedValue<T> {
+    fn with_locked_value<F, R>(self: &Self, f: F) -> R
+    where
+        F: FnOnce(T) -> R;
+}
+
+impl<'a, T: Clone> LockedValue<T> for Arc<Mutex<T>> {
+    fn with_locked_value<F, R>(self: &Self, f: F) -> R
+    where
+        F: FnOnce(T) -> R,
+    {
+        match self.try_lock() {
+            Ok(guard) => f(guard.clone()),
+            Err(_) => {
+                panic!("Failed to lock mutex")
+            }
+        }
+    }
+}
+
+fn with_locked_value<T: Clone, R>(value: &Arc<Mutex<T>>, f: impl FnOnce(T) -> R) -> R {
+    value.with_locked_value(f)
 }
 
 fn identity<T>(x: T) -> T {
@@ -225,7 +245,7 @@ pub fn configure_http_server<'a>(
         esp_idf_svc::http::Method::Get,
         |req| -> Result<(), esp_idf_svc::io::EspIOError> {
             let mut server_msg = String::new();
-            let amps: f32 = with_locked_value(expose_value, identity);
+            let amps = expose_value.with_locked_value(identity);
             let watts = amps * AC_VOLTS;
             write!(server_msg, "{:.12}", watts).unwrap();
             req.into_response(200, Some("OK"), &[("Content-Type", "text/plain")])?

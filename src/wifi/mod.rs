@@ -65,20 +65,15 @@ pub fn get_ssid_psk_from_nvs(
     }
 }
 
-pub fn setup_wifi<'d, M: WifiModemPeripheral>(
-    modem: impl Peripheral<P = M> + 'd,
-    ssid: String,
-    psk: String,
-    setup_mode: bool,
-    nvs: &nvs::EspNvsPartition<nvs::NvsDefault>,
-    sysloop: &EspSystemEventLoop,
-) -> Result<Arc<Mutex<EspWifi<'d>>>, EspError> {
-    let mut wifi = EspWifi::new(modem, sysloop.clone(), Some(nvs.clone()))?;
-
-    let wifi_config = if setup_mode {
-        wifi::Configuration::AccessPoint(AccessPointConfiguration {
+pub fn render_wifi_config(app_config: &crate::Config, ssid: String, psk: String, setup_mode: bool) -> wifi::Configuration {
+    if setup_mode {
+        wifi::Configuration::Mixed(ClientConfiguration {
             ssid: heapless::String::try_from(ssid.as_str()).expect("SSID too long"),
             password: heapless::String::try_from(psk.as_str()).expect("Password too long"),
+            ..Default::default()
+        }, AccessPointConfiguration {
+            ssid: heapless::String::try_from(app_config.wifi_ssid).expect("SSID too long"),
+            password: heapless::String::try_from(app_config.wifi_psk).expect("Password too long"),
             auth_method: wifi::AuthMethod::WPA2Personal,
             ..Default::default()
         })
@@ -88,7 +83,21 @@ pub fn setup_wifi<'d, M: WifiModemPeripheral>(
             password: heapless::String::try_from(psk.as_str()).expect("Password too long"),
             ..Default::default()
         })
-    };
+    }
+}
+
+pub fn setup_wifi<'d, M: WifiModemPeripheral>(
+    app_config: &crate::Config,
+    modem: impl Peripheral<P = M> + 'd,
+    ssid: String,
+    psk: String,
+    setup_mode: bool,
+    nvs: &nvs::EspNvsPartition<nvs::NvsDefault>,
+    sysloop: &EspSystemEventLoop,
+) -> Result<Arc<Mutex<EspWifi<'d>>>, EspError> {
+    let mut wifi = EspWifi::new(modem, sysloop.clone(), Some(nvs.clone()))?;
+
+    let wifi_config = render_wifi_config(app_config, ssid, psk, setup_mode);
     {
         if let Err(err) = wifi.set_configuration(&wifi_config) {
             log::info!("Wifi not started, error={}, starting now", err);
@@ -103,7 +112,8 @@ pub fn setup_wifi<'d, M: WifiModemPeripheral>(
 }
 
 pub fn reset_wifi<'a>(
-    wifi: Arc<Mutex<EspWifi<'a>>>,
+    app_config: &crate::Config,
+    wifi: &Arc<Mutex<EspWifi<'a>>>,
     ssid: String,
     psk: String,
     setup_mode: bool,
@@ -114,21 +124,7 @@ pub fn reset_wifi<'a>(
             wifi.stop()?;
 
             // Reset configuration
-            let wifi_config = if setup_mode {
-                wifi::Configuration::AccessPoint(AccessPointConfiguration {
-                    ssid: heapless::String::try_from(ssid.as_str()).expect("SSID too long"),
-                    password: heapless::String::try_from(psk.as_str()).expect("Password too long"),
-                    auth_method: wifi::AuthMethod::WPA2Personal,
-                    ..Default::default()
-                })
-            } else {
-                wifi::Configuration::Client(ClientConfiguration {
-                    ssid: heapless::String::try_from(ssid.as_str()).expect("SSID too long"),
-                    password: heapless::String::try_from(psk.as_str()).expect("Password too long"),
-                    ..Default::default()
-                })
-            };
-
+            let wifi_config = render_wifi_config(app_config, ssid, psk, setup_mode);
             {
                 if let Err(err) = wifi.set_configuration(&wifi_config) {
                     log::info!("Wifi not started, error={}, starting now", err);

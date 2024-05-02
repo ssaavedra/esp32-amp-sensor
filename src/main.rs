@@ -79,6 +79,7 @@ fn main() -> Result<(), EspError> {
         setup_mode
     );
     let wifi = wifi::setup_wifi(
+        &app_config,
         peripherals.modem,
         wifi_ssid,
         wifi_psk,
@@ -100,12 +101,16 @@ fn main() -> Result<(), EspError> {
         configure_http_server(&adc_value)?
     };
 
-    let gpio0 = peripherals.pins.gpio0;
-    let gpio0 = PinDriver::input(gpio0)?;
+    // BOOT button, used to check if we should enter setup mode
+    let gpio0 = PinDriver::input(peripherals.pins.gpio0)?;
 
-    let gpio2 = peripherals.pins.gpio2;
-    let mut gpio2 = PinDriver::output(gpio2)?;
+    // If set to low, do not blink the LED
+    let gpio34 = PinDriver::input(peripherals.pins.gpio34)?;
+    
+    // D2 is the builtin LED in HW-394
+    let mut gpio2 = PinDriver::output(peripherals.pins.gpio2)?;
     gpio2.set_drive_strength(gpio::DriveStrength::I5mA)?;
+
 
     let mut setup_mode_changed;
     let mut last_setup_mode = setup_mode;
@@ -118,7 +123,14 @@ fn main() -> Result<(), EspError> {
             setup_mode_changed = false;
         }
 
+        let high_level = if gpio34.is_high() {
+            gpio::Level::High
+        } else {
+            gpio::Level::Low
+        };
+
         if setup_mode_changed {
+            display_handler.run(|d| d.clear());
             drop(server);
 
             let (wifi_ssid, wifi_psk, _setup_mode) =
@@ -131,8 +143,8 @@ fn main() -> Result<(), EspError> {
                 wifi_psk.chars().count(),
                 setup_mode
             );
-            wifi::reset_wifi(wifi.clone(), wifi_ssid, wifi_psk, setup_mode)?;
-            // wifi::set_wifi_hostname("wattometer".to_string(), Arc::downgrade(&wifi), &sysloop);
+            wifi::reset_wifi(&app_config, &wifi, wifi_ssid, wifi_psk, setup_mode)?;
+            wifi::set_wifi_hostname("wattometer".to_string(), Arc::downgrade(&wifi), &sysloop);
 
             server = if setup_mode {
                 configure_setup_http_server(&mut nvs_partition)?
@@ -142,11 +154,11 @@ fn main() -> Result<(), EspError> {
         };
 
         if setup_mode {
-            display_handler.run(|d| d.clear());
+            display_handler.run(|d| d.set_position(0, 0));
             display_handler.run(|d| write!(d, "SETUP MODE AP:\n{}\n", app_config.wifi_ssid));
             display_handler.run(|d| write!(d, "KEY:\n{}\n", app_config.wifi_psk));
 
-            // Blink the LED
+            // Forcefully blink the LED even if we are in "quiet" mode to identify that we are in setup mode
             gpio2.set_high()?;
             FreeRtos::delay_ms(1000u32);
             gpio2.set_low()?;
@@ -177,7 +189,7 @@ fn main() -> Result<(), EspError> {
 
             // Tiny blink of LED if normal mode and wifi is connected
             if wifi.is_connected()? {
-                gpio2.set_high()?;
+                gpio2.set_level(high_level)?;
                 FreeRtos::delay_ms(100u32);
                 gpio2.set_low()?;
             }
