@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use esp_idf_svc::hal::modem::WifiModemPeripheral;
 use esp_idf_svc::hal::peripheral::Peripheral;
 use esp_idf_svc::handle::RawHandle as _;
-use esp_idf_svc::nvs;
+use esp_idf_svc::{hal, http, nvs};
 use esp_idf_svc::sys::esp_netif_set_hostname;
 pub use esp_idf_svc::wifi::{AccessPointConfiguration, WifiEvent};
 pub use esp_idf_svc::{
@@ -25,38 +25,19 @@ pub fn get_ssid_psk_from_nvs(
     force_setup: bool,
 ) -> Result<(String, String, bool), EspError> {
     let mut setup_mode = force_setup;
-    let wifi_ssid = {
-        let mut buf = [0u8; 32];
-        if let Err(e) = nvs.get_str("wifi_ssid", &mut buf) {
-            log::info!("Error reading wifi_ssid from NVS: {:?}", e);
-            buf.copy_from_slice(app_config.wifi_ssid.as_bytes());
-        } else {
-            log::info!("Read wifi_ssid from NVS {:}", String::from_utf8_lossy(&buf));
-        }
-        let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let buf = String::from_utf8_lossy(&buf[..nul]);
-        if buf.chars().count() == 0 {
+    let  wifi_ssid = match crate::nvs::read_str_from_nvs(nvs, "wifi_ssid") {
+        Ok(ssid) => ssid,
+        Err(_) => {
             setup_mode = true;
+            app_config.wifi_ssid.to_string()
         }
-        buf.to_string()
     };
-    let wifi_psk = {
-        let mut buf = [0u8; 64];
-        if let Err(e) = nvs.get_str("wifi_psk", &mut buf) {
-            log::info!("Error reading wifi_psk from NVS: {:?}", e);
-            buf.copy_from_slice(app_config.wifi_psk.as_bytes());
-        } else {
-            log::info!(
-                "Read wifi_psk from NVS {:}",
-                String::from_utf8_lossy(&buf).to_string()
-            );
-        }
-        let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let buf = String::from_utf8_lossy(&buf[..nul]);
-        if buf.chars().count() == 0 {
+    let wifi_psk = match crate::nvs::read_str_from_nvs(nvs, "wifi_psk") {
+        Ok(psk) => psk,
+        Err(_) => {
             setup_mode = true;
+            app_config.wifi_psk.to_string()
         }
-        buf.to_string()
     };
     if setup_mode {
         Ok((app_config.wifi_ssid.to_string(), app_config.wifi_psk.to_string(), true))
@@ -177,9 +158,18 @@ pub fn set_wifi_hostname<'a>(
 pub trait AppWifi {
     fn is_connected(&self) -> Result<bool, EspError>;
     fn get_client_ip(&self) -> Result<Ipv4Addr, EspError>;
+    fn connect(&self) -> Result<(), EspError>;
 }
 
 impl<'d> AppWifi for Arc<Mutex<EspWifi<'d>>> {
+    fn connect(&self) -> Result<(), EspError> {
+        match self.try_lock() {
+            Ok(mut wifi) => wifi.connect(),
+            Err(_) => Err(EspError::from_non_zero(
+                core::num::NonZeroI32::new(esp_idf_svc::sys::ESP_ERR_WIFI_NOT_CONNECT).unwrap(),
+            )),
+        }
+    }
     fn is_connected(&self) -> Result<bool, EspError> {
         match self.try_lock() {
             Ok(wifi) => wifi.is_connected(),
@@ -201,3 +191,30 @@ impl<'d> AppWifi for Arc<Mutex<EspWifi<'d>>> {
         }
     }
 }
+
+pub fn send_webhook<'a>(
+    webhook_url: &String,
+    wifi: &Arc<Mutex<EspWifi<'a>>>,
+    datum: &str,
+) -> anyhow::Result<usize> {
+    if !wifi.is_connected()? {
+        return Err(EspError::from_non_zero(
+            core::num::NonZeroI32::new(esp_idf_svc::sys::ESP_ERR_WIFI_NOT_CONNECT).unwrap(),
+        ).into());
+    }
+    log::info!("Sending webhook to {}", webhook_url);
+
+    // Create HTTPS Connection Handle
+    let httpconnection = http::client::EspHttpConnection::new(&http::client::Configuration {
+        use_global_ca_store: true,
+        crt_bundle_attach: Some(hal::sys::esp_crt_bundle_attach),
+        ..Default::default()
+    })?;
+    let mut client = embedded_svc::http::client::Client::wrap(httpconnection);
+    
+    // Send POST Request
+    let response = client.post(webhook_url, &[("Content-Type", "application/json")])?.write(datum.as_bytes())?;
+
+    Ok(response)
+}
+

@@ -67,6 +67,8 @@ fn render_setup_page<'r>(
         <input type=\"text\" id=\"wifi_ssid\" name=\"wifi_ssid\" value=\"{}\"><br>
         <label for=\"wifi_psk\">Wi-Fi Password:</label><br>
         <input type=\"password\" id=\"wifi_psk\" name=\"wifi_psk\"><br><br>
+        <label for=\"webhook\">URL to POST with the Amps in {{amps}} (if non-empty)</label><br>
+        <input type=\"text\" id=\"webhook\" name=\"webhook\" value=\"https://amps.ssaavedra.eu/?amps={{amps}}\"><br><br>
         <input type=\"submit\" value=\"Submit\">
         </body></html>",
         with_locked_value(&CURRENT_KNOWN_WIFI_SSID.clone(), identity)
@@ -94,16 +96,18 @@ pub fn configure_setup_http_server<'a>(
         esp_idf_svc::http::Method::Post,
         move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
             // Check that we have received wifi_ssid and wifi_psk as form data
-            let mut buf = [0u8; 128];
+            let mut buf = [0u8; 500];
             let read_bytes = req.read(&mut buf)?;
             let form_data = std::str::from_utf8(&buf).unwrap();
             let mut wifi_ssid = String::new();
             let mut wifi_psk = String::new();
-            // Form data is in the format "wifi_ssid=SSID&wifi_psk=PSK\0\0..."
+            let mut webhook = String::new();
+            // Form data is in the format "wifi_ssid=SSID&wifi_psk=PSK&webhook=...\0\0..."
             for (key, value) in form_data.split('&').map(split_urlencoded_kv) {
                 match key {
                     "wifi_ssid" => wifi_ssid = value,
                     "wifi_psk" => wifi_psk = value,
+                    "webhook" => webhook = value,
                     _ => (),
                 }
             }
@@ -117,9 +121,10 @@ pub fn configure_setup_http_server<'a>(
                 Ok(())
             } else {
                 log::info!(
-                    "Received Wi-Fi SSID: {:?}, Password: {:?}",
+                    "Received Wi-Fi SSID: {:?}, Password: {:?}, Webhook: {:?}",
                     wifi_ssid,
-                    wifi_psk
+                    wifi_psk,
+                    webhook
                 );
 
                 let mut nvs = nvs.lock().unwrap();
@@ -139,8 +144,12 @@ pub fn configure_setup_http_server<'a>(
                     log::warn!("Error setting wifi_psk in NVS: {:?}", x);
                 }
                 log::info!("Setting Wi-Fi PSK in NVS");
-
                 log::info!("Saved Wi-Fi credentials to NVS");
+
+                if let Err(x) = nvs.set_str("webhook", &webhook) {
+                    log::warn!("Error setting webhook in NVS: {:?}", x);
+                }
+
 
                 // Restart the device
                 unsafe {

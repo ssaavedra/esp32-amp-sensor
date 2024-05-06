@@ -35,9 +35,12 @@ where
     log::info!("Read {} samples", count);
     log::info!("Highest peak: {}", highest_peak);
     let peak = float_remap(highest_peak, 40.0, 1250.0, 0.0, 1.250);
+    let effective_volts = peak * 0.70710678118f32;
     log::info!("Peak: {}V", peak);
+    log::info!("Effv: {}V", effective_volts);
+    log::info!("Amps: {}A", effective_volts * FACTOR);
 
-    Ok(peak * FACTOR)
+    Ok(effective_volts * FACTOR)
 }
 
 fn float_remap(value: f32, in_min: f32, in_max: f32, out_min: f32, out_max: f32) -> f32 {

@@ -1,7 +1,6 @@
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::{adc, gpio};
-use esp_idf_svc::nvs;
 use esp_idf_svc::{
     hal::{
         adc::{attenuation, AdcChannelDriver, AdcDriver},
@@ -22,7 +21,9 @@ use std::{
 pub mod amps;
 pub mod display;
 pub mod http_server;
+pub mod nvs;
 pub mod wifi;
+use crate::nvs::read_str_from_nvs_or_default;
 use crate::wifi::AppWifi as _;
 
 // AC Voltage is 220V
@@ -52,10 +53,13 @@ fn main() -> Result<(), EspError> {
     let nvs = nvs::EspNvsPartition::<nvs::NvsDefault>::take()?;
     let mut nvs_partition = nvs::EspNvs::new(nvs.clone(), "ssaa", true)?;
 
-    // Set Pin 26 as OUTPUT and HIGH so that we have a VCC for the screen in the same side of everything
-    // as the 3V3 pin is on the other side of the board
+    // Need an additional VCC and GND pins for the SSD1306 display :)
     let mut gpio26 = PinDriver::output(peripherals.pins.gpio26).unwrap();
     gpio26.set_high()?;
+    let mut gpio27 = PinDriver::output(peripherals.pins.gpio27).unwrap();
+    gpio27.set_low()?;
+
+    // Set Pin 
 
     let mut display_handler = display::init_display_i2c(
         peripherals.pins.gpio25,
@@ -111,9 +115,10 @@ fn main() -> Result<(), EspError> {
     let mut gpio2 = PinDriver::output(peripherals.pins.gpio2)?;
     gpio2.set_drive_strength(gpio::DriveStrength::I5mA)?;
 
-
+    let mut wifi_disconnected_count = 0;
     let mut setup_mode_changed;
     let mut last_setup_mode = setup_mode;
+    let mut webhook_url = String::new();
 
     loop {
         if last_setup_mode != setup_mode {
@@ -132,6 +137,7 @@ fn main() -> Result<(), EspError> {
         if setup_mode_changed {
             display_handler.run(|d| d.clear());
             drop(server);
+            webhook_url = read_str_from_nvs_or_default(&nvs_partition, "webhook", "");
 
             let (wifi_ssid, wifi_psk, _setup_mode) =
                 wifi::get_ssid_psk_from_nvs(&app_config, &nvs_partition, setup_mode)?;
@@ -152,6 +158,8 @@ fn main() -> Result<(), EspError> {
                 configure_http_server(&adc_value)?
             };
         };
+
+
 
         if setup_mode {
             display_handler.run(|d| d.set_position(0, 0));
@@ -189,9 +197,19 @@ fn main() -> Result<(), EspError> {
 
             // Tiny blink of LED if normal mode and wifi is connected
             if wifi.is_connected()? {
+                wifi_disconnected_count = 0;
                 gpio2.set_level(high_level)?;
-                FreeRtos::delay_ms(100u32);
-                gpio2.set_low()?;
+            } else {
+                wifi_disconnected_count += 1;
+                if wifi_disconnected_count < 10 && wifi_disconnected_count % 10 == 0 {
+                    // If we are disconnected for more than 5 iterations, we will issue .connect() again
+                    wifi.connect()?;
+                } else if wifi_disconnected_count >= 20 {
+                    // If we are disconnected for more than 20 seconds, we will enter setup mode
+                    log::info!("Entering setup mode due to no Wi-Fi connection");
+                    setup_mode = true;
+                    continue;
+                }
             }
 
             display_handler.init(Brightness::DIM);
@@ -211,12 +229,27 @@ fn main() -> Result<(), EspError> {
             if wifi.is_connected()? {
                 let ip = wifi.get_client_ip()?;
                 display_handler.run(|d| write!(d, "{}\n", ip));
+
+                // Send via webhook
+                log::info!("Webhook: {:?}", webhook_url);
+                if webhook_url.is_empty() {
+                    display_handler.run(|d| write!(d, "NO WEBHOOK"));
+                } else {
+                    display_handler.run(|d| write!(d, "SENDING..."));
+                    let datum = format!("{{\"amps\":{:.5},\"watts\":{:.5}}}", amps, AC_VOLTS * amps);
+                    let _ = wifi::send_webhook(&webhook_url, &wifi, &datum);
+
+                display_handler.run(|d| write!(d, "OK"));
+                }
             } else {
                 display_handler.run(|d| write!(d, "CONNECTING..."));
             }
         }
 
-        // Sleep 1500ms
-        FreeRtos::delay_ms(1500u32);
+
+        // Sleep 1000ms
+        FreeRtos::delay_ms(100u32);
+        gpio2.set_low()?;
+        FreeRtos::delay_ms(900u32);
     }
 }
