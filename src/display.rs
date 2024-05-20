@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::Mutex;
+
 use esp_idf_svc::hal::gpio;
 use esp_idf_svc::hal::i2c;
 use esp_idf_svc::hal::peripheral::Peripheral;
@@ -92,4 +95,29 @@ pub fn init_display_i2c<'a, I2C: i2c::I2c, SIZE: TerminalDisplaySize>(
     );
     display_handler.init(Brightness::DIM);
     Ok(display_handler)
+}
+
+pub trait DisplayHandlerExt<DI, SIZE> {
+    fn run<E: std::fmt::Debug>(
+        &self,
+        f: impl FnOnce(&mut Ssd1306<DI, SIZE, TerminalMode>) -> Result<(), E>,
+    );
+    fn init(&self, brightness: Brightness);
+}
+
+impl<DI, SIZE> DisplayHandlerExt<DI, SIZE> for Arc<Mutex<DisplayHandler<DI, SIZE>>>
+where
+    DI: WriteOnlyDataCommand,
+    SIZE: TerminalDisplaySize,
+{
+    fn run<E: std::fmt::Debug>(
+        &self,
+        f: impl FnOnce(&mut Ssd1306<DI, SIZE, TerminalMode>) -> Result<(), E>,
+    ) {
+        self.try_lock().unwrap().run(f);
+    }
+
+    fn init(&self, brightness: Brightness) {
+        self.try_lock().unwrap().init(brightness);
+    }
 }

@@ -155,6 +155,8 @@ pub fn configure_setup_http_server<'a>(
                 unsafe {
                     esp_idf_svc::sys::esp_restart();
                 }
+                #[allow(unreachable_code)]
+                Ok(())
             }
         },
     )?;
@@ -169,6 +171,8 @@ pub fn configure_setup_http_server<'a>(
             unsafe {
                 esp_idf_svc::sys::esp_restart();
             }
+            #[allow(unreachable_code)]
+            Ok(())
         },
     )?;
 

@@ -1,11 +1,12 @@
+use crate::display::DisplayHandlerExt;
+use crate::state::PinDriverOutputArcExt as _;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::{adc, gpio};
 use esp_idf_svc::{
     hal::{
-        adc::{attenuation, AdcChannelDriver, AdcDriver},
+        adc::{AdcChannelDriver, AdcDriver},
         delay::FreeRtos,
-        gpio::Gpio35,
         peripherals::Peripherals,
     },
     sys::EspError,
@@ -13,6 +14,7 @@ use esp_idf_svc::{
 use http_server::{configure_http_server, configure_setup_http_server};
 use ssd1306::prelude::Brightness;
 use ssd1306::size::DisplaySize128x32;
+use std::borrow::BorrowMut;
 use std::{
     fmt::Write,
     sync::{Arc, Mutex},
@@ -22,6 +24,7 @@ pub mod amps;
 pub mod display;
 pub mod http_server;
 pub mod nvs;
+pub mod state;
 pub mod wifi;
 use crate::nvs::read_str_from_nvs_or_default;
 use crate::wifi::AppWifi as _;
@@ -41,6 +44,71 @@ pub struct Config {
     hostname: &'static str,
 }
 
+fn setup_peripherals<'a, 'b>(
+    peripherals: Peripherals,
+    app_config: &'b Config,
+    nvs: &'b nvs::EspNvsPartition<nvs::NvsDefault>,
+    sysloop: &'b EspSystemEventLoop,
+    wifi_ssid: String,
+    wifi_psk: String,
+    setup_mode: bool,
+) -> Result<
+    state::GlobalState<
+        'a,
+        ssd1306::prelude::I2CInterface<esp_idf_svc::hal::i2c::I2cDriver<'a>>,
+        DisplaySize128x32,
+    >,
+    EspError,
+> {
+    let adc_config = adc::config::Config::new();
+
+    let wifi = wifi::setup_wifi(
+        app_config,
+        peripherals.modem,
+        wifi_ssid,
+        wifi_psk,
+        setup_mode,
+        nvs,
+        sysloop,
+    )?;
+
+    // We'll set up these additional VCC and GND pins for the SSD1306 display,
+    // in case you are using HW-394 and you want to route only one side of the
+    // breadboard :)
+    // Even though you should not do this as a long-term solution, it should be
+    // probably OK for a prototype since the SSD1306 should draw <50mA
+    #[cfg(feature = "hw-394-prototype")]
+    {
+        let mut gpio26 = PinDriver::output(peripherals.pins.gpio26).unwrap();
+        gpio26.set_high()?;
+        let mut gpio27 = PinDriver::output(peripherals.pins.gpio27).unwrap();
+        gpio27.set_low()?;
+    }
+
+    // D2 is the builtin LED in HW-394 (when building your own board, you might
+    // need to solder gpio2 to a LED)
+    let mut gpio2 = PinDriver::output(peripherals.pins.gpio2)?;
+    gpio2.set_drive_strength(gpio::DriveStrength::I5mA)?;
+
+    Ok(state::GlobalState {
+        wifi: Arc::new(Mutex::new(wifi)),
+        setup_mode: Arc::new(Mutex::new(true)),
+        adc_value: Arc::new(Mutex::new(0f32)),
+        display_handler: Arc::new(Mutex::new(display::init_display_i2c(
+            peripherals.pins.gpio25,
+            peripherals.pins.gpio14,
+            peripherals.i2c0,
+            DisplaySize128x32,
+        )?)),
+        webhook_url: Arc::new(Mutex::new(String::new())),
+        gpio_btn_boot: PinDriver::input(peripherals.pins.gpio0)?,
+        adc_driver: Arc::new(Mutex::new(AdcDriver::new(peripherals.adc1, &adc_config)?)),
+        adc_chan_driver: Arc::new(Mutex::new(AdcChannelDriver::new(peripherals.pins.gpio35)?)),
+        quiet_mode_pin: PinDriver::input(peripherals.pins.gpio34)?,
+        blink_led: Arc::new(Mutex::new(gpio2)),
+    })
+}
+
 fn main() -> Result<(), EspError> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
@@ -53,22 +121,6 @@ fn main() -> Result<(), EspError> {
     let nvs = nvs::EspNvsPartition::<nvs::NvsDefault>::take()?;
     let mut nvs_partition = nvs::EspNvs::new(nvs.clone(), "ssaa", true)?;
 
-    // Need an additional VCC and GND pins for the SSD1306 display :)
-    let mut gpio26 = PinDriver::output(peripherals.pins.gpio26).unwrap();
-    gpio26.set_high()?;
-    let mut gpio27 = PinDriver::output(peripherals.pins.gpio27).unwrap();
-    gpio27.set_low()?;
-
-    // Set Pin 
-
-    let mut display_handler = display::init_display_i2c(
-        peripherals.pins.gpio25,
-        peripherals.pins.gpio14,
-        peripherals.i2c0,
-        DisplaySize128x32,
-    )?;
-
-    let pin_in = peripherals.pins.gpio35;
 
     let app_config = CONFIG;
 
@@ -82,38 +134,30 @@ fn main() -> Result<(), EspError> {
         wifi_psk.chars().count(),
         setup_mode
     );
-    let wifi = wifi::setup_wifi(
+
+
+    let global_state = setup_peripherals(
+        peripherals,
         &app_config,
-        peripherals.modem,
+        &nvs,
+        &sysloop,
         wifi_ssid,
         wifi_psk,
         setup_mode,
-        &nvs,
-        &sysloop,
     )?;
-    wifi::set_wifi_hostname("wattometer".to_string(), Arc::downgrade(&wifi), &sysloop);
+    wifi::set_wifi_hostname(
+        "wattometer".to_string(),
+        Arc::downgrade(&global_state.wifi),
+        &sysloop,
+    );
 
-    let adc_config = adc::config::Config::new();
-    let mut chan_driver: AdcChannelDriver<{ attenuation::DB_2_5 }, Gpio35> =
-        AdcChannelDriver::new(pin_in)?;
-    let mut driver = AdcDriver::new(peripherals.adc1, &adc_config)?;
-
-    let adc_value = Arc::new(Mutex::new(0f32));
-    let mut server = if setup_mode {
+    let mut server = if *global_state.setup_mode.try_lock().unwrap() {
         configure_setup_http_server(&mut nvs_partition)?
     } else {
-        configure_http_server(&adc_value)?
+        configure_http_server(&global_state.adc_value)?
     };
 
-    // BOOT button, used to check if we should enter setup mode
-    let gpio0 = PinDriver::input(peripherals.pins.gpio0)?;
-
-    // If set to low, do not blink the LED
-    let gpio34 = PinDriver::input(peripherals.pins.gpio34)?;
-    
-    // D2 is the builtin LED in HW-394
-    let mut gpio2 = PinDriver::output(peripherals.pins.gpio2)?;
-    gpio2.set_drive_strength(gpio::DriveStrength::I5mA)?;
+    let display_handler = global_state.display_handler.clone();
 
     let mut wifi_disconnected_count = 0;
     let mut setup_mode_changed;
@@ -128,7 +172,7 @@ fn main() -> Result<(), EspError> {
             setup_mode_changed = false;
         }
 
-        let high_level = if gpio34.is_high() {
+        let high_level = if global_state.quiet_mode_pin.is_high() {
             gpio::Level::High
         } else {
             gpio::Level::Low
@@ -149,17 +193,25 @@ fn main() -> Result<(), EspError> {
                 wifi_psk.chars().count(),
                 setup_mode
             );
-            wifi::reset_wifi(&app_config, &wifi, wifi_ssid, wifi_psk, setup_mode)?;
-            wifi::set_wifi_hostname("wattometer".to_string(), Arc::downgrade(&wifi), &sysloop);
+            wifi::reset_wifi(
+                &app_config,
+                &global_state.wifi,
+                wifi_ssid,
+                wifi_psk,
+                setup_mode,
+            )?;
+            wifi::set_wifi_hostname(
+                "wattometer".to_string(),
+                Arc::downgrade(&global_state.wifi),
+                &sysloop,
+            );
 
             server = if setup_mode {
                 configure_setup_http_server(&mut nvs_partition)?
             } else {
-                configure_http_server(&adc_value)?
+                configure_http_server(&global_state.adc_value)?
             };
         };
-
-
 
         if setup_mode {
             display_handler.run(|d| d.set_position(0, 0));
@@ -167,28 +219,28 @@ fn main() -> Result<(), EspError> {
             display_handler.run(|d| write!(d, "KEY:\n{}\n", app_config.wifi_psk));
 
             // Forcefully blink the LED even if we are in "quiet" mode to identify that we are in setup mode
-            gpio2.set_high()?;
+            global_state.blink_led.set_high()?;
             FreeRtos::delay_ms(1000u32);
-            gpio2.set_low()?;
+            global_state.blink_led.set_low()?;
             FreeRtos::delay_ms(1000u32); // Wait for longer, since this will just refresh the screen
 
-            if gpio0.is_low() {
+            if global_state.gpio_btn_boot.is_low() {
                 // If the BOOT button is pressed, we will exit setup mode
                 setup_mode = false;
                 // Blink twice to confirm
-                gpio2.set_high()?;
+                global_state.blink_led.set_high()?;
                 FreeRtos::delay_ms(100u32);
-                gpio2.set_low()?;
+                global_state.blink_led.set_low()?;
                 FreeRtos::delay_ms(100u32);
-                gpio2.set_high()?;
+                global_state.blink_led.set_high()?;
                 FreeRtos::delay_ms(100u32);
-                gpio2.set_low()?;
+                global_state.blink_led.set_low()?;
                 FreeRtos::delay_ms(500u32);
                 continue;
             }
         } else {
             // If the BOOT button is pressed, we will enter setup mode
-            if gpio0.is_low() {
+            if global_state.gpio_btn_boot.is_low() {
                 setup_mode = true;
                 continue;
             } else {
@@ -196,14 +248,14 @@ fn main() -> Result<(), EspError> {
             }
 
             // Tiny blink of LED if normal mode and wifi is connected
-            if wifi.is_connected()? {
+            if global_state.wifi.is_connected()? {
                 wifi_disconnected_count = 0;
-                gpio2.set_level(high_level)?;
+                global_state.blink_led.set_level(high_level)?;
             } else {
                 wifi_disconnected_count += 1;
                 if wifi_disconnected_count < 10 && wifi_disconnected_count % 10 == 0 {
                     // If we are disconnected for more than 5 iterations, we will issue .connect() again
-                    wifi.connect()?;
+                    global_state.wifi.connect()?;
                 } else if wifi_disconnected_count >= 20 {
                     // If we are disconnected for more than 20 seconds, we will enter setup mode
                     log::info!("Entering setup mode due to no Wi-Fi connection");
@@ -213,9 +265,13 @@ fn main() -> Result<(), EspError> {
             }
 
             display_handler.init(Brightness::DIM);
-            let amps = amps::read_amps(&mut driver, &mut chan_driver).unwrap();
+            let amps = amps::read_amps(
+                global_state.adc_driver_mut().unwrap().borrow_mut(),
+                global_state.adc_chan_driver_mut().unwrap().borrow_mut(),
+            )
+            .unwrap();
             {
-                let guard = adc_value.try_lock();
+                let guard = global_state.adc_value.try_lock();
                 match guard {
                     Ok(mut guard) => *guard = amps,
                     Err(_) => log::warn!("ADC value is locked"),
@@ -226,30 +282,32 @@ fn main() -> Result<(), EspError> {
             display_handler.run(|d| d.set_position(0, 0));
             display_handler.run(|d| write!(d, "{:.5}A    \n{:.5}W    \n", amps, AC_VOLTS * amps));
 
-            if wifi.is_connected()? {
-                let ip = wifi.get_client_ip()?;
-                display_handler.run(|d| write!(d, "{}\n", ip));
+            if let Ok(wifi) = global_state.wifi.try_lock() {
+                if wifi.is_connected()? {
+                    let ip = wifi::get_client_ip(&wifi)?;
+                    display_handler.run(|d| write!(d, "{}\n", ip));
 
-                // Send via webhook
-                log::info!("Webhook: {:?}", webhook_url);
-                if webhook_url.is_empty() {
-                    display_handler.run(|d| write!(d, "NO WEBHOOK"));
+                    // Send via webhook
+                    log::info!("Webhook: {:?}", webhook_url);
+                    if webhook_url.is_empty() {
+                        display_handler.run(|d| write!(d, "NO WEBHOOK"));
+                    } else {
+                        display_handler.run(|d| write!(d, "SENDING..."));
+                        let datum =
+                            format!("{{\"amps\":{:.5},\"watts\":{:.5}}}", amps, AC_VOLTS * amps);
+                        let _ = wifi::send_webhook(&webhook_url, &wifi, &datum);
+
+                        display_handler.run(|d| write!(d, "OK"));
+                    }
                 } else {
-                    display_handler.run(|d| write!(d, "SENDING..."));
-                    let datum = format!("{{\"amps\":{:.5},\"watts\":{:.5}}}", amps, AC_VOLTS * amps);
-                    let _ = wifi::send_webhook(&webhook_url, &wifi, &datum);
-
-                display_handler.run(|d| write!(d, "OK"));
+                    display_handler.run(|d| write!(d, "CONNECTING..."));
                 }
-            } else {
-                display_handler.run(|d| write!(d, "CONNECTING..."));
             }
         }
 
-
         // Sleep 1000ms
         FreeRtos::delay_ms(100u32);
-        gpio2.set_low()?;
+        global_state.blink_led.set_low()?;
         FreeRtos::delay_ms(900u32);
     }
 }
