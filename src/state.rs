@@ -5,6 +5,9 @@ use ssd1306::{mode::TerminalDisplaySize, prelude::WriteOnlyDataCommand};
 
 use crate::display;
 
+pub trait AsGlobalState<'a, DI: WriteOnlyDataCommand, SIZE: TerminalDisplaySize> {
+    fn as_global_state(&self) -> &GlobalState<'a, DI, SIZE>;
+}
 
 pub struct GlobalState<'a, DI: WriteOnlyDataCommand, SIZE: TerminalDisplaySize> {
     pub wifi: Arc<Mutex<esp_idf_svc::wifi::EspWifi<'a>>>,
@@ -21,6 +24,12 @@ pub struct GlobalState<'a, DI: WriteOnlyDataCommand, SIZE: TerminalDisplaySize> 
      */
     pub quiet_mode_pin: gpio::PinDriver<'a, gpio::Gpio34, gpio::Input>,
     pub blink_led: Arc<Mutex<gpio::PinDriver<'a, gpio::Gpio2, gpio::Output>>>,
+}
+
+impl<'a, DI: WriteOnlyDataCommand, SIZE: TerminalDisplaySize> AsGlobalState<'a, DI, SIZE> for GlobalState<'a, DI, SIZE> {
+    fn as_global_state(&self) -> &GlobalState<'a, DI, SIZE> {
+        self
+    }
 }
 
 impl<'a, DI, SIZE> GlobalState<'a, DI, SIZE> where DI: WriteOnlyDataCommand, SIZE: TerminalDisplaySize {

@@ -18,11 +18,11 @@ default = ["std", "embassy", "esp-idf-svc/native", "hw-394-prototype"]
 
 hw-394-prototype = []
 pio = ["esp-idf-svc/pio"]
-std = ["alloc", "esp-idf-svc/binstart", "esp-idf-svc/std"]
+std = ["alloc", "esp-idf-svc/binstart", "esp-idf-svc/std", "embassy-executor/arch-std"]
 alloc = ["esp-idf-svc/alloc"]
 nightly = ["esp-idf-svc/nightly"]
 experimental = ["esp-idf-svc/experimental"]
-embassy = ["esp-idf-svc/embassy-sync", "esp-idf-svc/critical-section", "esp-idf-svc/embassy-time-driver"]
+embassy = ["esp-idf-svc/embassy-sync", "esp-idf-svc/critical-section", "esp-idf-svc/embassy-time-driver", "embassy-executor/executor-thread"]
 
 [dependencies]
 log = { version = "0.4", default-features = false }

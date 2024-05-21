@@ -1,5 +1,6 @@
 use crate::display::DisplayHandlerExt;
 use crate::state::PinDriverOutputArcExt as _;
+use embassy_executor::Spawner;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::{adc, gpio};

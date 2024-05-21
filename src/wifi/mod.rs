@@ -18,8 +18,9 @@ pub use esp_idf_svc::{
     wifi::{self, AuthMethod, ClientConfiguration, Configuration, EspWifi},
 };
 use esp_idf_svc::{hal, http, nvs};
-use ssd1306::mode::TerminalDisplaySize;
-use ssd1306::prelude::WriteOnlyDataCommand;
+use ssd1306::size::DisplaySize128x32;
+
+use crate::state::AsGlobalState;
 
 pub fn get_ssid_psk_from_nvs(
     app_config: &crate::Config,
@@ -155,12 +156,24 @@ pub fn reset_wifi<'a>(
 }
 
 
-pub async fn wifi_handle_task<'a, DI: WriteOnlyDataCommand, SIZE: TerminalDisplaySize>(
+#[embassy_executor::task]
+pub async fn wifi_handle_task(
+    app_config: crate::Config,
+    nvs: nvs::EspNvsPartition<nvs::NvsDefault>,
+    global_state: impl AsGlobalState<'static, ssd1306::prelude::I2CInterface<esp_idf_svc::hal::i2c::I2cDriver<'static>>, DisplaySize128x32> + 'static
+) -> ! {
+    loop {
+        let _ = wifi_handle_task_worker(&app_config, &nvs, &global_state).await;
+    }
+}
+
+pub async fn wifi_handle_task_worker(
     app_config: &crate::Config,
     nvs: &nvs::EspNvsPartition<nvs::NvsDefault>,
-    global_state: &'a crate::state::GlobalState<'a, DI, SIZE>,
+    global_state: &impl AsGlobalState<'static, ssd1306::prelude::I2CInterface<esp_idf_svc::hal::i2c::I2cDriver<'static>>, DisplaySize128x32>
 ) -> Result<(), EspError> {
     let mut seconds_disconnected = 0;
+    let global_state = global_state.as_global_state();
     loop {
         let nvs_partition = nvs::EspNvs::new(nvs.clone(), "ssaa", false)?;
         let (ssid, psk, hostname, rendered_setup_mode) = get_ssid_psk_from_nvs(app_config, &nvs_partition, *global_state.setup_mode.lock().unwrap())?;
