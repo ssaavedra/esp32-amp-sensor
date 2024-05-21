@@ -18,12 +18,14 @@ pub use esp_idf_svc::{
     wifi::{self, AuthMethod, ClientConfiguration, Configuration, EspWifi},
 };
 use esp_idf_svc::{hal, http, nvs};
+use ssd1306::mode::TerminalDisplaySize;
+use ssd1306::prelude::WriteOnlyDataCommand;
 
 pub fn get_ssid_psk_from_nvs(
     app_config: &crate::Config,
     nvs: &nvs::EspNvs<nvs::NvsDefault>,
     force_setup: bool,
-) -> Result<(String, String, bool), EspError> {
+) -> Result<(String, String, String, bool), EspError> {
     let mut setup_mode = force_setup;
     let wifi_ssid = match crate::nvs::read_str_from_nvs(nvs, "wifi_ssid") {
         Ok(ssid) => ssid,
@@ -39,14 +41,22 @@ pub fn get_ssid_psk_from_nvs(
             app_config.wifi_psk.to_string()
         }
     };
+    let hostname = match crate::nvs::read_str_from_nvs(nvs, "hostname") {
+        Ok(hostname) => hostname,
+        Err(_) => {
+            app_config.default_hostname.to_string()
+        }
+    };
+
     if setup_mode {
         Ok((
             app_config.wifi_ssid.to_string(),
             app_config.wifi_psk.to_string(),
+            hostname,
             true,
         ))
     } else {
-        Ok((wifi_ssid, wifi_psk, setup_mode))
+        Ok((wifi_ssid, wifi_psk, hostname, setup_mode))
     }
 }
 
@@ -85,6 +95,7 @@ pub fn setup_wifi<'d, M: WifiModemPeripheral>(
     modem: impl Peripheral<P = M> + 'd,
     ssid: String,
     psk: String,
+    hostname: String,
     setup_mode: bool,
     nvs: &nvs::EspNvsPartition<nvs::NvsDefault>,
     sysloop: &EspSystemEventLoop,
@@ -93,10 +104,15 @@ pub fn setup_wifi<'d, M: WifiModemPeripheral>(
 
     let wifi_config = render_wifi_config(app_config, ssid, psk, setup_mode);
     {
+        set_wifi_hostname_once(hostname, &wifi);
         if let Err(err) = wifi.set_configuration(&wifi_config) {
             log::info!("Wifi not started, error={}, starting now", err);
         }
         wifi.start()?;
+        let raw_handle = wifi.sta_netif().handle();
+        unsafe {
+            esp_netif_set_hostname(raw_handle, app_config.default_hostname.as_ptr() as _);
+        }
         if !setup_mode {
             wifi.connect()?;
         }
@@ -113,8 +129,9 @@ pub fn reset_wifi<'a>(
 ) -> Result<(), EspError> {
     match wifi.try_lock() {
         Ok(mut wifi) => {
-            wifi.disconnect()?;
-            wifi.stop()?;
+            // We don't care if disconnecting fails at all
+            let _ = wifi.disconnect();
+            let _ = wifi.stop();
 
             // Reset configuration
             let wifi_config = render_wifi_config(app_config, ssid, psk, setup_mode);
@@ -138,6 +155,68 @@ pub fn reset_wifi<'a>(
 }
 
 
+pub async fn wifi_handle_task<'a, DI: WriteOnlyDataCommand, SIZE: TerminalDisplaySize>(
+    app_config: &crate::Config,
+    nvs: &nvs::EspNvsPartition<nvs::NvsDefault>,
+    global_state: &'a crate::state::GlobalState<'a, DI, SIZE>,
+) -> Result<(), EspError> {
+    let mut seconds_disconnected = 0;
+    loop {
+        let nvs_partition = nvs::EspNvs::new(nvs.clone(), "ssaa", false)?;
+        let (ssid, psk, hostname, rendered_setup_mode) = get_ssid_psk_from_nvs(app_config, &nvs_partition, *global_state.setup_mode.lock().unwrap())?;
+        let wifi_config = render_wifi_config(app_config, ssid.clone(), psk.clone(), rendered_setup_mode);
+        if let Ok(mut wifi) = global_state.wifi.lock() {
+            set_wifi_hostname_once(hostname, &wifi);
+            if let Err(err) = wifi.set_configuration(&wifi_config) {
+                log::info!("Wifi not started, error={}, starting now", err);
+            }
+            wifi.start()?;
+            if !rendered_setup_mode {
+                wifi.connect()?;
+            }
+        }
+        FreeRtos::delay_ms(1000);
+        if let Ok(mut setup_mode) = global_state.setup_mode.lock() {
+            if !*setup_mode {
+                if !global_state.wifi.is_connected()? {
+                    seconds_disconnected += 1;
+                    log::info!("Wi-Fi disconnected for {} seconds", seconds_disconnected);
+                    if seconds_disconnected > 3 && seconds_disconnected % 5 == 0 {
+                        // Issue the connect command again
+                        if let Ok(mut wifi) = global_state.wifi.lock() {
+                            wifi.connect()?;
+                        }
+                    }
+                    if seconds_disconnected > 30 {
+                        log::info!("Resetting Wi-Fi");
+                        *setup_mode = true;
+                        // Release the lock early since we don't really need it anymore
+                        drop(setup_mode);
+                        reset_wifi(app_config, &global_state.wifi, ssid, psk, true)?;
+                    }
+                } else {
+                    seconds_disconnected = 0;
+                }
+            
+            }
+        }
+    }
+}
+
+
+pub fn set_wifi_hostname_once(mut hostname: String, wifi: &EspWifi) {
+    let raw_handle = wifi.sta_netif().handle();
+    if hostname.len() > 32 {
+        log::warn!("Hostname too long, truncating to 32 characters");
+        hostname = hostname.chars().take(32).collect();
+    }
+    unsafe {
+        // Safe because we are passing a null-terminated string and sta_netif must exist (as it is safe Rust)
+        esp_netif_set_hostname(raw_handle, hostname.as_ptr() as _);
+    };
+    log::info!("Hostname set to {}", hostname);
+}
+
 pub fn set_wifi_hostname<'a, 'b>(
     hostname: String,
     wifi: std::sync::Weak<Mutex<EspWifi<'static>>>,
@@ -148,23 +227,15 @@ pub fn set_wifi_hostname<'a, 'b>(
     sysloop
         .subscribe::<WifiEvent, _>(move |event| {
             let hostname_copy = hostname.clone();
-            if let WifiEvent::ApStaConnected = event {
+            if let WifiEvent::StaConnected = event {
                 log::info!("Connected to Wi-Fi");
-                let raw_handle = {
-                    match wifi.upgrade() {
-                        Some(wifi) => match wifi.lock() {
-                            Ok(wifi) => wifi.sta_netif().handle(),
-                            Err(_) => return,
-                        },
-                        None => return,
-                    }
+                let _ = match wifi.upgrade() {
+                    Some(wifi) => match wifi.lock() {
+                        Ok(wifi) => 
+                            set_wifi_hostname_once(hostname_copy, &wifi),
+                        Err(_) => return,                        },
+                    None => return,
                 };
-                // Set hostname now!
-                unsafe {
-                    // Safe because we are passing a null-terminated string and sta_netif_mut must exist when connected to wifi
-                    esp_netif_set_hostname(raw_handle, hostname_copy.as_ptr() as _);
-                    log::info!("Hostname set to {}", hostname_copy);
-                }
             }
         })
         .map_err(|err| log::error!("Failed to subscribe to WifiEvent: {:?}", err))

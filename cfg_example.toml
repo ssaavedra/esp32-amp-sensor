@@ -1,3 +1,4 @@
 [esp32-amp-sensor]
 wifi_ssid = ""
 wifi_psk = ""
+default_hostname = "wattometer"

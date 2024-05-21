@@ -41,7 +41,7 @@ pub struct Config {
     #[default("")]
     wifi_psk: &'static str,
     #[default("wattometer")]
-    hostname: &'static str,
+    default_hostname: &'static str,
 }
 
 fn setup_peripherals<'a, 'b>(
@@ -51,6 +51,7 @@ fn setup_peripherals<'a, 'b>(
     sysloop: &'b EspSystemEventLoop,
     wifi_ssid: String,
     wifi_psk: String,
+    hostname: String,
     setup_mode: bool,
 ) -> Result<
     state::GlobalState<
@@ -61,16 +62,6 @@ fn setup_peripherals<'a, 'b>(
     EspError,
 > {
     let adc_config = adc::config::Config::new();
-
-    let wifi = wifi::setup_wifi(
-        app_config,
-        peripherals.modem,
-        wifi_ssid,
-        wifi_psk,
-        setup_mode,
-        nvs,
-        sysloop,
-    )?;
 
     // We'll set up these additional VCC and GND pins for the SSD1306 display,
     // in case you are using HW-394 and you want to route only one side of the
@@ -89,6 +80,17 @@ fn setup_peripherals<'a, 'b>(
     // need to solder gpio2 to a LED)
     let mut gpio2 = PinDriver::output(peripherals.pins.gpio2)?;
     gpio2.set_drive_strength(gpio::DriveStrength::I5mA)?;
+
+    let wifi = wifi::setup_wifi(
+        app_config,
+        peripherals.modem,
+        wifi_ssid,
+        wifi_psk,
+        hostname,
+        setup_mode,
+        nvs,
+        sysloop,
+    )?;
 
     Ok(state::GlobalState {
         wifi: Arc::new(Mutex::new(wifi)),
@@ -124,7 +126,7 @@ fn main() -> Result<(), EspError> {
 
     let app_config = CONFIG;
 
-    let (wifi_ssid, wifi_psk, mut setup_mode) =
+    let (wifi_ssid, wifi_psk, hostname, mut setup_mode) =
         wifi::get_ssid_psk_from_nvs(&app_config, &nvs_partition, false)?;
     log::info!(
         "SSID: {:?} (len={}), PSK: {:?} (len={}) (setup={})",
@@ -143,10 +145,11 @@ fn main() -> Result<(), EspError> {
         &sysloop,
         wifi_ssid,
         wifi_psk,
+        hostname,
         setup_mode,
     )?;
     wifi::set_wifi_hostname(
-        "wattometer".to_string(),
+        app_config.default_hostname.to_string(),
         Arc::downgrade(&global_state.wifi),
         &sysloop,
     );
@@ -183,7 +186,7 @@ fn main() -> Result<(), EspError> {
             drop(server);
             webhook_url = read_str_from_nvs_or_default(&nvs_partition, "webhook", "");
 
-            let (wifi_ssid, wifi_psk, _setup_mode) =
+            let (wifi_ssid, wifi_psk, hostname, _setup_mode) =
                 wifi::get_ssid_psk_from_nvs(&app_config, &nvs_partition, setup_mode)?;
             log::info!(
                 "SSID: {:?} (len={}), PSK: {:?} (len={}) (setup={})",
@@ -201,7 +204,7 @@ fn main() -> Result<(), EspError> {
                 setup_mode,
             )?;
             wifi::set_wifi_hostname(
-                "wattometer".to_string(),
+                hostname,
                 Arc::downgrade(&global_state.wifi),
                 &sysloop,
             );
