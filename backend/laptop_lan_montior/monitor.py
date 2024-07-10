@@ -277,7 +277,7 @@ class MockChargingState(ChargingState):
         return self.get_mock_info()["house_amps"]
 
     async def set_car_charge_amps(self, requested_amps: int):
-        print("Setting car charge amps to", requested_amps)
+        print(">>>> API CALL >>>> Setting car charge amps to", requested_amps)
 
     async def get_car_geo(self) -> GeoLocation:
         return GeoLocation(**self.get_mock_info()["car_geo"])
@@ -288,12 +288,21 @@ class MockChargingState(ChargingState):
 
 
 class LiveChargingState(ChargingState):
+    last_requested_amps = 0
+
     async def request_current_house_amps(self) -> float:
         async with self.aiohttp_session.get(wattmeter_api) as response:
             return float(await response.text())
 
     async def set_car_charge_amps(self, requested_amps: int):
-        await self.aiohttp_session.post(
+        if requested_amps == self.last_requested_amps:
+            print("Not sending request to API. Already asked but RealWorld was slow to react.")
+            return
+        
+        print(">>>> API CALL >>>> Setting car charge amps to", requested_amps)
+
+        self.last_requested_amps = requested_amps
+        return await self.aiohttp_session.post(
             f"{tessie_api}{vehicle_vin}/command/set_charging_amps?amps={requested_amps}",
             headers={
                 "accept": "application/json",
