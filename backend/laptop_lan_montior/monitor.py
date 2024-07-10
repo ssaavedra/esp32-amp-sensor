@@ -4,8 +4,11 @@ import asyncio
 import math
 import os
 from pprint import pprint
+from dotenv import load_dotenv
 
 import click
+
+load_dotenv()
 
 wattmeter_api = os.environ.get("WATTMETER_API_URL", "http://127.0.0.1:4000/amps") 
 tessie_api = os.environ.get("TESSIE_API_URL", "https://api.tessie.com/")
