@@ -12,7 +12,10 @@ use esp_idf_svc::{
     },
     sys::EspError,
 };
-use http_server::{configure_http_server, configure_setup_http_server, CURRENT_KNOWN_WEBHOOK, CURRENT_KNOWN_WIFI_SSID};
+use http_server::{
+    configure_http_server, configure_setup_http_server, CURRENT_KNOWN_WEBHOOK,
+    CURRENT_KNOWN_WIFI_SSID,
+};
 use ssd1306::prelude::Brightness;
 use ssd1306::size::DisplaySize128x32;
 use state::AsGlobalState;
@@ -307,10 +310,13 @@ fn main() -> Result<(), EspError> {
                     if webhook_url.is_empty() {
                         display_handler.run(|d| write!(d, "NO WEBHOOK"));
                     } else {
-                        display_handler.run(|d| write!(d, "SENDING..."));
+                        display_handler.run(|d| write!(d, "SENDING...  "));
                         let _ = wifi::send_webhook(&webhook_url, &wifi, amps, AC_VOLTS * amps);
 
-                        display_handler.run(|d| write!(d, "OK"));
+                        display_handler.run(|d| {
+                            let _ = d.set_column(80);
+                            write!(d, "OK")
+                        });
                     }
                 } else {
                     display_handler.run(|d| write!(d, "CONNECTING..."));
