@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
-from typing import Literal, TypedDict
-import aiohttp
 import asyncio
-from datetime import datetime, timedelta
 import json
 import math
 import os
 import pickle
-from pprint import pprint
-from dotenv import load_dotenv
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import TypedDict
 
+import aiohttp
 import asyncclick as click
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -196,17 +195,21 @@ class ChargingState:
         print("Target house amps:", self.max_house_amps)
 
         # Calculate the new car amps based on the weighted average house amps and the max house budgeted amps (use 80% of the budget)
-        new_car_amps = (
-            min(
-                self.max_car_amps,
-                max(
-                    0,
-                    self.max_house_amps * 0.8 - weighted_avg_house_amps,
-                ),
-            )
+        new_car_amps = min(
+            self.max_car_amps,
+            max(
+                0,
+                self.max_house_amps * 0.8 - weighted_avg_house_amps,
+            ),
         )
 
-        print("New car amps:", new_car_amps, self.max_car_amps, self.max_house_amps, self.max_house_amps * 0.8)
+        print(
+            "New car amps:",
+            new_car_amps,
+            self.max_car_amps,
+            self.max_house_amps,
+            self.max_house_amps * 0.8,
+        )
         new_car_amps = int(new_car_amps)
 
         # Don't overreact (but do react if we're off by more than 1A, or if we are overshooting)
@@ -250,6 +253,7 @@ class ChargingState:
 
 class MockChargingState(ChargingState):
     mock_file = "mock.json"
+
     async def force_refresh_state(self) -> TessieCarState:
         return {
             "charge_state": {
@@ -264,9 +268,11 @@ class MockChargingState(ChargingState):
                 "speed": 0,
             },
         }
+
     def get_mock_info(self):
         with open(self.mock_file, "r") as f:
             return json.load(f)
+
     async def request_current_house_amps(self) -> float:
         return self.get_mock_info()["house_amps"]
 
