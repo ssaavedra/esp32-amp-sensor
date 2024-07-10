@@ -50,7 +50,9 @@ fn split_urlencoded_kv<'a>(input: &'a str) -> (&'a str, String) {
     (key, value[..nul].to_string())
 }
 
-static CURRENT_KNOWN_WIFI_SSID: Lazy<Arc<Mutex<String>>> =
+pub(crate) static CURRENT_KNOWN_WIFI_SSID: Lazy<Arc<Mutex<String>>> =
+    Lazy::new(|| Arc::new(Mutex::new(String::new())));
+pub(crate) static CURRENT_KNOWN_WEBHOOK: Lazy<Arc<Mutex<String>>> =
     Lazy::new(|| Arc::new(Mutex::new(String::new())));
 
 fn render_setup_page<'r>(
@@ -66,12 +68,14 @@ fn render_setup_page<'r>(
         <label for=\"wifi_ssid\">Wi-Fi SSID:</label><br>
         <input type=\"text\" id=\"wifi_ssid\" name=\"wifi_ssid\" value=\"{}\"><br>
         <label for=\"wifi_psk\">Wi-Fi Password:</label><br>
-        <input type=\"password\" id=\"wifi_psk\" name=\"wifi_psk\"><br><br>
+        <input type=\"password\" id=\"wifi_psk\" name=\"wifi_psk\" value\"{}\"><br><br>
         <label for=\"webhook\">URL to POST with the Amps in {{amps}} (if non-empty)</label><br>
-        <input type=\"text\" id=\"webhook\" name=\"webhook\" value=\"https://amps.ssaavedra.eu/?amps={{amps}}\"><br><br>
+        <input type=\"text\" id=\"webhook\" name=\"webhook\" value=\"{}\"><br><br>
         <input type=\"submit\" value=\"Submit\">
         </body></html>",
-        with_locked_value(&CURRENT_KNOWN_WIFI_SSID.clone(), identity)
+        with_locked_value(&CURRENT_KNOWN_WIFI_SSID.clone(), identity),
+        "",
+        with_locked_value(&CURRENT_KNOWN_WEBHOOK.clone(), identity),
     )
     .unwrap();
     req.into_response(200, Some("OK"), &[("Content-Type", "text/html")])?
@@ -79,16 +83,12 @@ fn render_setup_page<'r>(
     Ok(())
 }
 
-#[inline(always)]
-pub fn configure_setup_http_server<'a>(
+fn add_server_setup_handlers<'a>(
     nvs: &'a mut nvs::EspNvs<nvs::NvsDefault>,
-) -> Result<EspHttpServer<'a>, EspError> {
-    let server_config = Configuration::default();
-    let mut server = EspHttpServer::new(&server_config).expect("Failed to create server");
-
+    server: &mut EspHttpServer<'a>,
+) -> Result<(), EspError> {
     let nvs = Arc::new(Mutex::new(nvs));
 
-    server.fn_handler("/", esp_idf_svc::http::Method::Get, render_setup_page)?;
     server.fn_handler("/save", esp_idf_svc::http::Method::Get, render_setup_page)?;
 
     server.fn_handler(
@@ -149,6 +149,7 @@ pub fn configure_setup_http_server<'a>(
                 if let Err(x) = nvs.set_str("webhook", &webhook) {
                     log::warn!("Error setting webhook in NVS: {:?}", x);
                 }
+                log::info!("Setting Webhook in NVS");
 
 
                 // Restart the device
@@ -176,6 +177,19 @@ pub fn configure_setup_http_server<'a>(
         },
     )?;
 
+    Ok(())
+}
+
+#[inline(always)]
+pub fn configure_setup_http_server<'a>(
+    nvs: &'a mut nvs::EspNvs<nvs::NvsDefault>,
+) -> Result<EspHttpServer<'a>, EspError> {
+    let server_config = Configuration::default();
+    let mut server = EspHttpServer::new(&server_config).expect("Failed to create server");
+
+
+    server.fn_handler("/", esp_idf_svc::http::Method::Get, render_setup_page)?;
+    add_server_setup_handlers(nvs, &mut server)?;
     Ok(server)
 }
 
@@ -210,6 +224,7 @@ fn identity<T>(x: T) -> T {
 #[inline(always)]
 pub fn configure_http_server<'a>(
     expose_value: &'a Arc<Mutex<f32>>,
+    nvs: &'a mut nvs::EspNvs<nvs::NvsDefault>,
 ) -> Result<EspHttpServer<'a>, EspError> {
     // // Start Http Server
     let server_config = Configuration::default();
@@ -238,6 +253,8 @@ pub fn configure_http_server<'a>(
             Ok(())
         },
     )?;
+
+    add_server_setup_handlers(nvs, &mut server)?;
 
     server.fn_handler(
         "/amps",

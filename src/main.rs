@@ -12,9 +12,10 @@ use esp_idf_svc::{
     },
     sys::EspError,
 };
-use http_server::{configure_http_server, configure_setup_http_server};
+use http_server::{configure_http_server, configure_setup_http_server, CURRENT_KNOWN_WEBHOOK, CURRENT_KNOWN_WIFI_SSID};
 use ssd1306::prelude::Brightness;
 use ssd1306::size::DisplaySize128x32;
+use state::AsGlobalState;
 use std::borrow::BorrowMut;
 use std::{
     fmt::Write,
@@ -53,6 +54,7 @@ fn setup_peripherals<'a, 'b>(
     wifi_ssid: String,
     wifi_psk: String,
     hostname: String,
+    webhook_url: String,
     setup_mode: bool,
 ) -> Result<
     state::GlobalState<
@@ -85,7 +87,7 @@ fn setup_peripherals<'a, 'b>(
     let wifi = wifi::setup_wifi(
         app_config,
         peripherals.modem,
-        wifi_ssid,
+        wifi_ssid.clone(),
         wifi_psk,
         hostname,
         setup_mode,
@@ -95,7 +97,8 @@ fn setup_peripherals<'a, 'b>(
 
     Ok(state::GlobalState {
         wifi: Arc::new(Mutex::new(wifi)),
-        setup_mode: Arc::new(Mutex::new(true)),
+        wifi_ssid: Arc::new(Mutex::new(wifi_ssid)),
+        setup_mode: Arc::new(Mutex::new(setup_mode)),
         adc_value: Arc::new(Mutex::new(0f32)),
         display_handler: Arc::new(Mutex::new(display::init_display_i2c(
             peripherals.pins.gpio25,
@@ -103,7 +106,7 @@ fn setup_peripherals<'a, 'b>(
             peripherals.i2c0,
             DisplaySize128x32,
         )?)),
-        webhook_url: Arc::new(Mutex::new(String::new())),
+        webhook_url: Arc::new(Mutex::new(webhook_url)),
         gpio_btn_boot: PinDriver::input(peripherals.pins.gpio0)?,
         adc_driver: Arc::new(Mutex::new(AdcDriver::new(peripherals.adc1, &adc_config)?)),
         adc_chan_driver: Arc::new(Mutex::new(AdcChannelDriver::new(peripherals.pins.gpio35)?)),
@@ -124,7 +127,6 @@ fn main() -> Result<(), EspError> {
     let nvs = nvs::EspNvsPartition::<nvs::NvsDefault>::take()?;
     let mut nvs_partition = nvs::EspNvs::new(nvs.clone(), "ssaa", true)?;
 
-
     let app_config = CONFIG;
 
     let (wifi_ssid, wifi_psk, hostname, mut setup_mode) =
@@ -138,7 +140,7 @@ fn main() -> Result<(), EspError> {
         setup_mode
     );
 
-
+    let mut webhook_url = read_str_from_nvs_or_default(&nvs_partition, "webhook", "");
     let global_state = setup_peripherals(
         peripherals,
         &app_config,
@@ -147,6 +149,7 @@ fn main() -> Result<(), EspError> {
         wifi_ssid,
         wifi_psk,
         hostname,
+        webhook_url.clone(),
         setup_mode,
     )?;
     wifi::set_wifi_hostname(
@@ -155,10 +158,14 @@ fn main() -> Result<(), EspError> {
         &sysloop,
     );
 
-    let mut server = if *global_state.setup_mode.try_lock().unwrap() {
-        configure_setup_http_server(&mut nvs_partition)?
-    } else {
-        configure_http_server(&global_state.adc_value)?
+    let mut server = {
+        let setup_mode = global_state.setup_mode.lock().unwrap();
+        if *setup_mode {
+            log::info!("Starting EspHttpServer in setup mode");
+            configure_setup_http_server(&mut nvs_partition)?
+        } else {
+            configure_http_server(&global_state.adc_value, &mut nvs_partition)?
+        }
     };
 
     let display_handler = global_state.display_handler.clone();
@@ -166,7 +173,15 @@ fn main() -> Result<(), EspError> {
     let mut wifi_disconnected_count = 0;
     let mut setup_mode_changed;
     let mut last_setup_mode = setup_mode;
-    let mut webhook_url = String::new();
+
+    *CURRENT_KNOWN_WIFI_SSID.try_lock().unwrap() = global_state
+        .as_global_state()
+        .wifi_ssid
+        .try_lock()
+        .unwrap()
+        .clone();
+
+    *CURRENT_KNOWN_WEBHOOK.try_lock().unwrap() = webhook_url.clone();
 
     loop {
         if last_setup_mode != setup_mode {
@@ -191,7 +206,7 @@ fn main() -> Result<(), EspError> {
                 wifi::get_ssid_psk_from_nvs(&app_config, &nvs_partition, setup_mode)?;
             log::info!(
                 "SSID: {:?} (len={}), PSK: {:?} (len={}) (setup={})",
-                wifi_ssid.as_bytes(),
+                wifi_ssid,
                 wifi_ssid.chars().count(),
                 wifi_psk,
                 wifi_psk.chars().count(),
@@ -204,16 +219,12 @@ fn main() -> Result<(), EspError> {
                 wifi_psk,
                 setup_mode,
             )?;
-            wifi::set_wifi_hostname(
-                hostname,
-                Arc::downgrade(&global_state.wifi),
-                &sysloop,
-            );
+            wifi::set_wifi_hostname(hostname, Arc::downgrade(&global_state.wifi), &sysloop);
 
             server = if setup_mode {
                 configure_setup_http_server(&mut nvs_partition)?
             } else {
-                configure_http_server(&global_state.adc_value)?
+                configure_http_server(&global_state.adc_value, &mut nvs_partition)?
             };
         };
 
@@ -248,7 +259,7 @@ fn main() -> Result<(), EspError> {
                 setup_mode = true;
                 continue;
             } else {
-                log::info!("Normal mode");
+                log::info!("Normal mode (setup={})", setup_mode);
             }
 
             // Tiny blink of LED if normal mode and wifi is connected
@@ -297,9 +308,7 @@ fn main() -> Result<(), EspError> {
                         display_handler.run(|d| write!(d, "NO WEBHOOK"));
                     } else {
                         display_handler.run(|d| write!(d, "SENDING..."));
-                        let datum =
-                            format!("{{\"amps\":{:.5},\"watts\":{:.5}}}", amps, AC_VOLTS * amps);
-                        let _ = wifi::send_webhook(&webhook_url, &wifi, &datum);
+                        let _ = wifi::send_webhook(&webhook_url, &wifi, amps, AC_VOLTS * amps);
 
                         display_handler.run(|d| write!(d, "OK"));
                     }

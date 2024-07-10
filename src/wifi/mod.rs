@@ -22,32 +22,43 @@ use ssd1306::size::DisplaySize128x32;
 
 use crate::state::AsGlobalState;
 
+pub fn non_empty_string_or_fail(s: String) -> Result<String, EspError> {
+    if s.len() == 0 {
+        Err(EspError::from_non_zero(
+            core::num::NonZeroI32::new(esp_idf_svc::sys::ESP_ERR_INVALID_ARG).unwrap(),
+        ))
+    } else {
+        Ok(s)
+    }
+}
+
 pub fn get_ssid_psk_from_nvs(
     app_config: &crate::Config,
     nvs: &nvs::EspNvs<nvs::NvsDefault>,
     force_setup: bool,
 ) -> Result<(String, String, String, bool), EspError> {
     let mut setup_mode = force_setup;
-    let wifi_ssid = match crate::nvs::read_str_from_nvs(nvs, "wifi_ssid") {
-        Ok(ssid) => ssid,
-        Err(_) => {
-            setup_mode = true;
-            app_config.wifi_ssid.to_string()
-        }
-    };
-    let wifi_psk = match crate::nvs::read_str_from_nvs(nvs, "wifi_psk") {
-        Ok(psk) => psk,
-        Err(_) => {
-            setup_mode = true;
-            app_config.wifi_psk.to_string()
-        }
-    };
-    let hostname = match crate::nvs::read_str_from_nvs(nvs, "hostname") {
-        Ok(hostname) => hostname,
-        Err(_) => {
-            app_config.default_hostname.to_string()
-        }
-    };
+    let wifi_ssid =
+        match crate::nvs::read_str_from_nvs(nvs, "wifi_ssid").and_then(non_empty_string_or_fail) {
+            Ok(ssid) => ssid,
+            Err(_) => {
+                setup_mode = true;
+                app_config.wifi_ssid.to_string()
+            }
+        };
+    let wifi_psk =
+        match crate::nvs::read_str_from_nvs(nvs, "wifi_psk").and_then(non_empty_string_or_fail) {
+            Ok(psk) => psk,
+            Err(_) => {
+                setup_mode = true;
+                app_config.wifi_psk.to_string()
+            }
+        };
+    let hostname =
+        match crate::nvs::read_str_from_nvs(nvs, "hostname").and_then(non_empty_string_or_fail) {
+            Ok(hostname) => hostname,
+            Err(_) => app_config.default_hostname.to_string(),
+        };
 
     if setup_mode {
         Ok((
@@ -111,6 +122,7 @@ pub fn setup_wifi<'d, M: WifiModemPeripheral>(
         }
         wifi.start()?;
         let raw_handle = wifi.sta_netif().handle();
+        log::info!("Setting hostname to {}!", app_config.default_hostname);
         unsafe {
             esp_netif_set_hostname(raw_handle, app_config.default_hostname.as_ptr() as _);
         }
@@ -155,12 +167,15 @@ pub fn reset_wifi<'a>(
     Ok(())
 }
 
-
 #[embassy_executor::task]
 pub async fn wifi_handle_task(
     app_config: crate::Config,
     nvs: nvs::EspNvsPartition<nvs::NvsDefault>,
-    global_state: impl AsGlobalState<'static, ssd1306::prelude::I2CInterface<esp_idf_svc::hal::i2c::I2cDriver<'static>>, DisplaySize128x32> + 'static
+    global_state: impl AsGlobalState<
+            'static,
+            ssd1306::prelude::I2CInterface<esp_idf_svc::hal::i2c::I2cDriver<'static>>,
+            DisplaySize128x32,
+        > + 'static,
 ) -> ! {
     loop {
         let _ = wifi_handle_task_worker(&app_config, &nvs, &global_state).await;
@@ -170,14 +185,23 @@ pub async fn wifi_handle_task(
 pub async fn wifi_handle_task_worker(
     app_config: &crate::Config,
     nvs: &nvs::EspNvsPartition<nvs::NvsDefault>,
-    global_state: &impl AsGlobalState<'static, ssd1306::prelude::I2CInterface<esp_idf_svc::hal::i2c::I2cDriver<'static>>, DisplaySize128x32>
+    global_state: &impl AsGlobalState<
+        'static,
+        ssd1306::prelude::I2CInterface<esp_idf_svc::hal::i2c::I2cDriver<'static>>,
+        DisplaySize128x32,
+    >,
 ) -> Result<(), EspError> {
     let mut seconds_disconnected = 0;
     let global_state = global_state.as_global_state();
     loop {
         let nvs_partition = nvs::EspNvs::new(nvs.clone(), "ssaa", false)?;
-        let (ssid, psk, hostname, rendered_setup_mode) = get_ssid_psk_from_nvs(app_config, &nvs_partition, *global_state.setup_mode.lock().unwrap())?;
-        let wifi_config = render_wifi_config(app_config, ssid.clone(), psk.clone(), rendered_setup_mode);
+        let (ssid, psk, hostname, rendered_setup_mode) = get_ssid_psk_from_nvs(
+            app_config,
+            &nvs_partition,
+            *global_state.setup_mode.lock().unwrap(),
+        )?;
+        let wifi_config =
+            render_wifi_config(app_config, ssid.clone(), psk.clone(), rendered_setup_mode);
         if let Ok(mut wifi) = global_state.wifi.lock() {
             set_wifi_hostname_once(hostname, &wifi);
             if let Err(err) = wifi.set_configuration(&wifi_config) {
@@ -210,12 +234,10 @@ pub async fn wifi_handle_task_worker(
                 } else {
                     seconds_disconnected = 0;
                 }
-            
             }
         }
     }
 }
-
 
 pub fn set_wifi_hostname_once(mut hostname: String, wifi: &EspWifi) {
     let raw_handle = wifi.sta_netif().handle();
@@ -223,6 +245,7 @@ pub fn set_wifi_hostname_once(mut hostname: String, wifi: &EspWifi) {
         log::warn!("Hostname too long, truncating to 32 characters");
         hostname = hostname.chars().take(32).collect();
     }
+    log::info!("Setting hostname to {}!", hostname);
     unsafe {
         // Safe because we are passing a null-terminated string and sta_netif must exist (as it is safe Rust)
         esp_netif_set_hostname(raw_handle, hostname.as_ptr() as _);
@@ -244,9 +267,9 @@ pub fn set_wifi_hostname<'a, 'b>(
                 log::info!("Connected to Wi-Fi");
                 let _ = match wifi.upgrade() {
                     Some(wifi) => match wifi.lock() {
-                        Ok(wifi) => 
-                            set_wifi_hostname_once(hostname_copy, &wifi),
-                        Err(_) => return,                        },
+                        Ok(wifi) => set_wifi_hostname_once(hostname_copy, &wifi),
+                        Err(_) => return,
+                    },
                     None => return,
                 };
             }
@@ -299,7 +322,8 @@ impl<'d> AppWifi for Arc<Mutex<EspWifi<'d>>> {
 pub fn send_webhook<'a>(
     webhook_url: &String,
     wifi: &EspWifi<'a>,
-    datum: &str,
+    amps: f32,
+    watts: f32,
 ) -> anyhow::Result<usize> {
     if !wifi.is_connected()? {
         return Err(EspError::from_non_zero(
@@ -309,6 +333,8 @@ pub fn send_webhook<'a>(
     }
     log::info!("Sending webhook to {}", webhook_url);
 
+    let datum = format!("{{\"amps\":{:.5},\"watts\":{:.5}}}", amps, watts);
+
     // Create HTTPS Connection Handle
     let httpconnection = http::client::EspHttpConnection::new(&http::client::Configuration {
         use_global_ca_store: true,
@@ -317,9 +343,18 @@ pub fn send_webhook<'a>(
     })?;
     let mut client = embedded_svc::http::client::Client::wrap(httpconnection);
 
+    // If the URL contains {{amps}}, replace it with the actual amps
+    let webhook_url = webhook_url.clone().replace("{{amps}}", &amps.to_string());
+
     // Send POST Request
     let response = client
-        .post(webhook_url, &[("Content-Type", "application/json")])?
+        .post(
+            &webhook_url,
+            &[
+                ("Content-Type", "application/json"),
+                ("Content-Length", &datum.len().to_string()),
+            ],
+        )?
         .write(datum.as_bytes())?;
 
     Ok(response)

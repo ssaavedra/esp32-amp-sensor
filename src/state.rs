@@ -11,6 +11,7 @@ pub trait AsGlobalState<'a, DI: WriteOnlyDataCommand, SIZE: TerminalDisplaySize>
 
 pub struct GlobalState<'a, DI: WriteOnlyDataCommand, SIZE: TerminalDisplaySize> {
     pub wifi: Arc<Mutex<esp_idf_svc::wifi::EspWifi<'a>>>,
+    pub wifi_ssid: Arc<Mutex<String>>,
     pub setup_mode: Arc<Mutex<bool>>,
     pub adc_value: Arc<Mutex<f32>>,
     pub display_handler: Arc<Mutex<display::DisplayHandler<DI, SIZE>>>,
