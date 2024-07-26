@@ -1,20 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import backoff
 import json
+import logging
 import math
 import os
 import pickle
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import aiohttp
 import asyncclick as click
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Add a handler that will log messages with timestamp in front
+log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter(log_format))
+logger.addHandler(handler)
+
 
 wattmeter_api = os.environ.get("WATTMETER_API_URL", "http://127.0.0.1:4000/amps")
 tessie_api = os.environ.get("TESSIE_API_URL", "https://api.tessie.com/")
@@ -59,6 +71,34 @@ charger_geo = GeoLocation(lat=charger_lat, lon=charger_lon)
 class TessieChargeState(TypedDict):
     charge_amps: float
     charge_current_request: float
+    charge_enable_request: bool
+    charge_energy_added: float
+    charge_limit_soc: int
+    charge_limit_soc_max: int
+    charge_limit_soc_min: int
+    charge_limit_soc_std: int
+    charge_miles_added_ideal: float
+    charge_miles_added_rated: float
+    charge_port_cold_weather_mode: bool
+    charge_port_door_open: bool
+    charge_port_latch: str
+    charge_rate: float
+    charger_actual_current: float
+    charger_phases: Literal[1, 3] | None
+    charger_pilot_current: float
+    charger_power: float
+    charger_voltage: float
+    charging_state: Literal[
+        "Complete",
+        "Charging",
+        "Disconnected",
+        "Pending",
+        "Starting",
+        "Stopped",
+    ]
+    conn_charge_cable: str | Literal["IEC", "J1772", "CCS", "SCHUKO", "UNKNOWN"]
+    fast_charger_brand: str
+    fast_charger_present: bool
 
 
 class TessieDriveState(TypedDict):
@@ -85,9 +125,10 @@ class ChargingState:
         max_car_amps: float = 16,
         charger_geo: GeoLocation = charger_geo,
         charger_radius: float = charger_radius,
+        is_enabled: bool = True,
     ):
         self.aiohttp_session = aiohttp_session
-        self.api_cache_time = timedelta(seconds=60)
+        self.api_cache_time = timedelta(seconds=30)
         self.wattmeter_sliding_window_size = timedelta(minutes=5)
         self.wattmeter_sliding_window_resolution = timedelta(seconds=1)
         self.wattmeter_sliding_window = []
@@ -100,6 +141,7 @@ class ChargingState:
 
         self.state = {}
         self.state_time = datetime(1970, 1, 1)
+        self.is_enabled = is_enabled
 
         self.car_in_location = False
         self.car_distance_to_location = math.inf
@@ -111,6 +153,7 @@ class ChargingState:
             self.state_time = datetime.now()
         yield TessieCarState(self.state)
 
+    @backoff.on_exception(backoff.expo, asyncio.TimeoutError, max_time=60)
     async def force_refresh_state(self) -> TessieCarState:
         async with self.aiohttp_session.get(
             f"{tessie_api}{vehicle_vin}/state",
@@ -123,10 +166,14 @@ class ChargingState:
 
     @property
     def current_car_amps(self) -> float:
+        if self.state["charge_state"]["charging_state"] != "Charging":
+            return 0
         return self.state["charge_state"]["charge_amps"]
 
     async def tick_sliding_window(self):
-        print(" ", end=".", flush=True)
+        # print(" ", end=".", flush=True)
+        if not self.is_enabled:
+            return
         async with self.with_latest_data():
             self.current_house_amps = await self.request_current_house_amps()
             self.wattmeter_sliding_window.append(self.current_house_amps)
@@ -136,8 +183,8 @@ class ChargingState:
                 > self.wattmeter_sliding_window_size
                 / self.wattmeter_sliding_window_resolution
             ):
-                print(
-                    "Removed from both windows: ",
+                logger.debug(
+                    "Removed from both windows: %f, %f",
                     self.wattmeter_sliding_window.pop(0),
                     self.car_amps_sliding_window.pop(0),
                 )
@@ -175,40 +222,45 @@ class ChargingState:
         - Only call the API if the car amps need to be changed.
         """
         if len(self.wattmeter_sliding_window) == 0:
-            print("tick_set_car_amps: Empty sliding window. Skipping.")
+            logger.warn("tick_set_car_amps: Empty sliding window. Skipping.")
+            return
+        if self.is_enabled is False:
+            logger.info("tick_set_car_amps: Disabled. Skipping.")
+            return
+        if self.state["charge_state"]["charging_state"] != "Charging":
+            logger.info("Car is not charging. Skipping.")
             return
 
         # Calculate the weighted average
         weighted_avg_house_amps = self.weighted_avg(self.wattmeter_sliding_window)
 
-        print("Current house amps:", weighted_avg_house_amps)
+        logger.info("Current house amps: %f", weighted_avg_house_amps)
 
         # Calculate the weighted average car amps
         weighted_avg_car_amps = self.weighted_avg(self.car_amps_sliding_window)
 
-        print("Current car amps:", weighted_avg_car_amps)
+        logger.info("Current car amps: %f", weighted_avg_car_amps)
 
         # The weighted_avg_house_amps includes the car amps, so we need to subtract them
         weighted_avg_house_amps -= weighted_avg_car_amps
 
-        print("Current house amps (without car):", weighted_avg_house_amps)
-        print("Target house amps:", self.max_house_amps)
+        logger.info("Current house amps (without car): %f", weighted_avg_house_amps)
+        logger.info("Target house amps: %f", self.max_house_amps)
 
         # Calculate the new car amps based on the weighted average house amps and the max house budgeted amps (use 80% of the budget)
         new_car_amps = min(
             self.max_car_amps,
             max(
                 0,
-                self.max_house_amps * 0.8 - weighted_avg_house_amps,
+                self.max_house_amps - weighted_avg_house_amps,
             ),
         )
 
-        print(
-            "New car amps:",
+        logger.debug(
+            "New car amps: %f %f %f",
             new_car_amps,
             self.max_car_amps,
             self.max_house_amps,
-            self.max_house_amps * 0.8,
         )
         new_car_amps = int(new_car_amps)
 
@@ -216,18 +268,16 @@ class ChargingState:
         if new_car_amps == int(self.current_car_amps) or new_car_amps - 1 == int(
             self.current_car_amps
         ):
-            print(
-                f"Not overreacting. Keeping the same car amps (was {self.current_car_amps})."
+            logger.info(
+                f"Not overreacting. Keeping the same car amps (target would be {new_car_amps}, was {self.current_car_amps})."
             )
             return
 
         # Set the new car amps
-        print(
-            "Setting car charge amps to",
+        logger.info(
+            "Setting car charge amps to %f (was %f)",
             new_car_amps,
-            " (was",
             self.current_car_amps,
-            ")",
         )
         await self.set_car_charge_amps(new_car_amps)
 
@@ -256,6 +306,9 @@ class MockChargingState(ChargingState):
 
     async def force_refresh_state(self) -> TessieCarState:
         return {
+            "access_type": "mock",
+            "api_version": 1,
+            "display_name": "Mock",
             "charge_state": {
                 "charge_amps": 0,
                 "charge_current_request": 0,
@@ -277,7 +330,7 @@ class MockChargingState(ChargingState):
         return self.get_mock_info()["house_amps"]
 
     async def set_car_charge_amps(self, requested_amps: int):
-        print(">>>> API CALL >>>> Setting car charge amps to", requested_amps)
+        logger.info(">>>> API CALL >>>> Setting car charge amps to %f", requested_amps)
 
     async def get_car_geo(self) -> GeoLocation:
         return GeoLocation(**self.get_mock_info()["car_geo"])
@@ -290,16 +343,18 @@ class MockChargingState(ChargingState):
 class LiveChargingState(ChargingState):
     last_requested_amps = 0
 
+    @backoff.on_exception(backoff.expo, asyncio.TimeoutError, max_time=60)
     async def request_current_house_amps(self) -> float:
         async with self.aiohttp_session.get(wattmeter_api) as response:
             return float(await response.text())
 
+    @backoff.on_exception(backoff.expo, asyncio.TimeoutError, max_time=60)
     async def set_car_charge_amps(self, requested_amps: int):
         if requested_amps == self.last_requested_amps:
-            print("Not sending request to API. Already asked but RealWorld was slow to react.")
+            logger.info("Not sending request to API. Already asked but RealWorld was slow to react.")
             return
         
-        print(">>>> API CALL >>>> Setting car charge amps to", requested_amps)
+        logger.info(">>>> API CALL >>>> Setting car charge amps to %f", requested_amps)
 
         self.last_requested_amps = requested_amps
         return await self.aiohttp_session.post(
@@ -339,6 +394,33 @@ def looping_task(func, every_seconds) -> asyncio.Task:
     return asyncio.create_task(loop())
 
 
+def is_car_nearby(cache: ChargingState):
+    async def loop():
+        cache.is_enabled = False
+        while True:
+            logger.debug("[CHECK] Car nearby? ")
+            if not await cache.is_car_nearby():
+                logger.debug("[CHECK] nearby = False")
+                car_max_speed_kmh = 150
+                car_min_time_to_charger = await cache.car_min_time_to_charger()
+                distance = await cache.get_car_distance_to_location()
+                distance = round(distance, 2)
+                logger.debug(
+                    f"It will take the car at least {car_min_time_to_charger} to get to the charger (at {car_max_speed_kmh} km/h, {distance}m away)"
+                )
+                logger.info(f"Sleeping for {car_min_time_to_charger}.")
+                await asyncio.sleep(car_min_time_to_charger.total_seconds())
+                continue
+            else:
+                distance = await cache.get_car_distance_to_location()
+                logger.info(f"[CHECK] nearby = True  # ({distance} meters)")
+                cache.is_enabled = True
+                break
+    
+    return asyncio.create_task(loop())
+
+
+
 @click.command()
 @click.option("--every_seconds", type=int, default=1)
 @click.option("--threshold", type=float, default=11.3)
@@ -369,46 +451,33 @@ async def cli(
                 with open("cache.pickle", "rb") as f:
                     cache = pickle.load(f)
                     if not isinstance(cache, main_class):
-                        print("Invalid cache. Initializing new cache.")
+                        logger.warn("Invalid cache. Initializing new cache.")
                         cache = main_class(aiohttp_session=session)
             else:
                 cache = main_class(aiohttp_session=session)
-
+            
+            cache.aiohttp_session = session
             cache.charger_geo = charger_geo
             cache.charger_radius = charger_radius
             cache.max_car_amps = max_car_amps
             cache.max_house_amps = threshold
+            cache.is_enabled = True
 
-            if check_location:
-                while True:
-                    print("[CHECK] Car nearby? ")
-                    if not await cache.is_car_nearby():
-                        print("[CHECK] nearby = False")
-                        car_max_speed_kmh = 150
-                        car_min_time_to_charger = await cache.car_min_time_to_charger()
-                        distance = await cache.get_car_distance_to_location()
-                        distance = round(distance, 2)
-                        print(
-                            f"It will take the car at least {car_min_time_to_charger} to get to the charger (at {car_max_speed_kmh} km/h, {distance}m away)"
-                        )
-                        print(f"Sleeping for {car_min_time_to_charger}.")
-                        await asyncio.sleep(car_min_time_to_charger.total_seconds())
-                        continue
-                    else:
-                        distance = await cache.get_car_distance_to_location()
-                        print(f"[CHECK] nearby = True  # ({distance} meters)")
-                        break
+            while True:
+                if check_location:
+                    task_location = is_car_nearby(cache)
+                    await asyncio.wait([task_location])
 
-            task1 = looping_task(cache.tick_sliding_window, every_seconds)
-            task2 = looping_task(cache.tick_set_car_amps, every_seconds * 5)
-
-            r = await asyncio.wait([task1, task2], return_when=asyncio.FIRST_EXCEPTION)
-            raise r[0].pop().exception()
+                task1 = looping_task(cache.tick_sliding_window, every_seconds)
+                task2 = looping_task(cache.tick_set_car_amps, every_seconds * 5)
+                r = await asyncio.wait([task1, task2], return_when=asyncio.FIRST_EXCEPTION)
+                raise r[0].pop().exception()
 
     finally:
         if persistent_cache:
             with open("cache.pickle", "wb") as f:
                 cache.aiohttp_session = None
+                cache.is_enabled = True
                 pickle.dump(cache, f)
 
 
