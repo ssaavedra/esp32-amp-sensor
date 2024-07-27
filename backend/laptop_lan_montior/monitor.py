@@ -484,11 +484,14 @@ async def cli(
                     r = await asyncio.wait([task1, task2], return_when=asyncio.FIRST_EXCEPTION)
                     raise r[0].pop().exception()
                 
-        except KeyboardInterrupt:
+        except asyncio.CancelledError:
             exit = True
+            logger.info("KeyboardInterrupt. Exiting.")
+            task1.cancel()
+            task2.cancel()
 
-        except Exception as e:
-            logger.error(f"Exception: {e}")
+        except BaseException as e:
+            logger.error(f"Exception: {type(e)}")
             logger.exception(e)
 
         finally:
