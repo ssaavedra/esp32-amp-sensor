@@ -271,10 +271,10 @@ fn main() -> Result<(), EspError> {
                 global_state.blink_led.set_level(high_level)?;
             } else {
                 wifi_disconnected_count += 1;
-                if wifi_disconnected_count < 10 && wifi_disconnected_count % 10 == 0 {
+                if wifi_disconnected_count < 51 && wifi_disconnected_count % 10 == 0 {
                     // If we are disconnected for more than 5 iterations, we will issue .connect() again
                     global_state.wifi.connect()?;
-                } else if wifi_disconnected_count >= 20 {
+                } else if wifi_disconnected_count >= 55 {
                     // If we are disconnected for more than 20 seconds, we will enter setup mode
                     log::info!("Entering setup mode due to no Wi-Fi connection");
                     setup_mode = true;
