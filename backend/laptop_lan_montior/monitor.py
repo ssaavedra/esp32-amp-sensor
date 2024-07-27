@@ -155,6 +155,7 @@ class ChargingState:
 
     @backoff.on_exception(backoff.expo, asyncio.TimeoutError, max_time=60)
     async def force_refresh_state(self) -> TessieCarState:
+        logger.debug(">>>> API CALL >>>> Refreshing state.")
         async with self.aiohttp_session.get(
             f"{tessie_api}{vehicle_vin}/state",
             headers={
@@ -163,6 +164,10 @@ class ChargingState:
             },
         ) as response:
             return TessieCarState(await response.json())
+        
+    async def force_refresh_state_delayed(self, delay_secs: int = 10):
+        await asyncio.sleep(delay_secs)
+        await self.force_refresh_state()
 
     @property
     def current_car_amps(self) -> float:
@@ -280,6 +285,7 @@ class ChargingState:
             self.current_car_amps,
         )
         await self.set_car_charge_amps(new_car_amps)
+        asyncio.create_task(self.force_refresh_state_delayed(10))
 
     async def set_car_charge_amps(self, requested_amps: int):
         raise NotImplementedError("set_car_charge_amps")
@@ -423,7 +429,8 @@ def is_car_nearby(cache: ChargingState):
 
 @click.command()
 @click.option("--every_seconds", type=int, default=1)
-@click.option("--threshold", type=float, default=11.3)
+# @click.option("--threshold", type=float, default=11.3)
+@click.option("--threshold", type=float, default=10.8)
 @click.option("--warn_after_threshold", type=int, default=2)
 @click.option("--max_car_amps", type=int, default=10)
 @click.option("--persistent-cache", is_flag=True, default=True)
@@ -443,42 +450,51 @@ async def cli(
 
     main_class = MockChargingState if test else LiveChargingState
 
-    try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as session:
-            if persistent_cache and os.path.exists("cache.pickle"):
-                with open("cache.pickle", "rb") as f:
-                    cache = pickle.load(f)
-                    if not isinstance(cache, main_class):
-                        logger.warn("Invalid cache. Initializing new cache.")
-                        cache = main_class(aiohttp_session=session)
-            else:
-                cache = main_class(aiohttp_session=session)
-            
-            cache.aiohttp_session = session
-            cache.charger_geo = charger_geo
-            cache.charger_radius = charger_radius
-            cache.max_car_amps = max_car_amps
-            cache.max_house_amps = threshold
-            cache.is_enabled = True
+    exit = False
 
-            while True:
-                if check_location:
-                    task_location = is_car_nearby(cache)
-                    await asyncio.wait([task_location])
+    while not exit:
 
-                task1 = looping_task(cache.tick_sliding_window, every_seconds)
-                task2 = looping_task(cache.tick_set_car_amps, every_seconds * 5)
-                r = await asyncio.wait([task1, task2], return_when=asyncio.FIRST_EXCEPTION)
-                raise r[0].pop().exception()
-
-    finally:
-        if persistent_cache:
-            with open("cache.pickle", "wb") as f:
-                cache.aiohttp_session = None
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as session:
+                if persistent_cache and os.path.exists("cache.pickle"):
+                    with open("cache.pickle", "rb") as f:
+                        cache = pickle.load(f)
+                        if not isinstance(cache, main_class):
+                            logger.warn("Invalid cache. Initializing new cache.")
+                            cache = main_class(aiohttp_session=session)
+                else:
+                    cache = main_class(aiohttp_session=session)
+                
+                cache.aiohttp_session = session
+                cache.charger_geo = charger_geo
+                cache.charger_radius = charger_radius
+                cache.max_car_amps = max_car_amps
+                cache.max_house_amps = threshold
                 cache.is_enabled = True
-                pickle.dump(cache, f)
+
+                while True:
+                    if check_location:
+                        task_location = is_car_nearby(cache)
+                        await asyncio.wait([task_location])
+
+                    task1 = looping_task(cache.tick_sliding_window, every_seconds)
+                    task2 = looping_task(cache.tick_set_car_amps, every_seconds * 5)
+                    r = await asyncio.wait([task1, task2], return_when=asyncio.FIRST_EXCEPTION)
+                    raise r[0].pop().exception()
+                
+        except KeyboardInterrupt:
+            exit = True
+
+        finally:
+            if persistent_cache:
+                with open("cache.pickle", "wb") as f:
+                    cache.aiohttp_session = None
+                    cache.is_enabled = True
+                    pickle.dump(cache, f)
+            logger.info("Exiting.")
+            await asyncio.sleep(15)
 
 
 def test_check_location():
