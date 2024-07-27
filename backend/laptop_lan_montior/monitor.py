@@ -487,6 +487,10 @@ async def cli(
         except KeyboardInterrupt:
             exit = True
 
+        except Exception as e:
+            logger.error(f"Exception: {e}")
+            logger.exception(e)
+
         finally:
             if persistent_cache:
                 with open("cache.pickle", "wb") as f:
@@ -494,7 +498,8 @@ async def cli(
                     cache.is_enabled = True
                     pickle.dump(cache, f)
             logger.info("Exiting.")
-            await asyncio.sleep(15)
+            if not exit:
+                await asyncio.sleep(15)
 
 
 def test_check_location():
