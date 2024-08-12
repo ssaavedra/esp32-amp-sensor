@@ -3,7 +3,7 @@ pub use esp_idf_svc::nvs::*;
 use esp_idf_svc::sys::EspError;
 
 pub fn read_str_from_nvs<T: NvsPartitionId>(nvs: &nvs::EspNvs<T>, key: &str) -> Result<String, EspError> {
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; 128];
     match nvs.get_str(key, &mut buf) {
         Ok(_) => {
             let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
