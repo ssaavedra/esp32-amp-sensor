@@ -163,6 +163,9 @@ class ChargingState:
                 "authorization": "Bearer " + tessie_token,
             },
         ) as response:
+            if response.status != 200:
+                print("Got headers: ", response.headers)
+                raise Exception(await response.text())
             return TessieCarState(await response.json())
         
     async def force_refresh_state_delayed(self, delay_secs: int = 10):
@@ -181,6 +184,7 @@ class ChargingState:
             return
         async with self.with_latest_data():
             self.current_house_amps = await self.request_current_house_amps()
+            logger.debug("Current house & car amps: %f, %f", self.current_house_amps, self.current_car_amps)
             self.wattmeter_sliding_window.append(self.current_house_amps)
             self.car_amps_sliding_window.append(self.current_car_amps)
             while (
@@ -188,11 +192,14 @@ class ChargingState:
                 > self.wattmeter_sliding_window_size
                 / self.wattmeter_sliding_window_resolution
             ):
-                logger.debug(
-                    "Removed from both windows: %f, %f",
-                    self.wattmeter_sliding_window.pop(0),
-                    self.car_amps_sliding_window.pop(0),
-                )
+                _house_oldest = self.wattmeter_sliding_window.pop(0)
+                _car_oldest = self.car_amps_sliding_window.pop(0)
+                # logger.debug(
+                #     "Removed from both windows: %f, %f",
+                #     _house_oldest,
+                #     _car_oldest,
+                # )
+                pass    
 
     async def request_current_house_amps(self) -> float:
         raise NotImplementedError("request_current_house_amps")
@@ -493,6 +500,8 @@ async def cli(
         except BaseException as e:
             logger.error(f"Exception: {type(e)}")
             logger.exception(e)
+            task1.cancel()
+            task2.cancel()
 
         finally:
             if persistent_cache:
